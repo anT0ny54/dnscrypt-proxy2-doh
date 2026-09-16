@@ -112,8 +112,11 @@ cert_refresh_delay = 360
 bootstrap_resolvers = ['9.9.9.11:53', '8.8.8.8:53']
 
 ignore_system_dns = true
+## 0 skips the startup network probe entirely -- appropriate in a container
+## that's expected to have working egress already. This also makes
+## netprobe_address unused; it's commented out rather than left looking active.
 netprobe_timeout = 0
-netprobe_address = '9.9.9.9:53'
+# netprobe_address = '9.9.9.9:53'
 
 # offline_mode = false
 # query_meta = ['key1:value1']
