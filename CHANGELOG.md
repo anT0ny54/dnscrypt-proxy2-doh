@@ -1,9 +1,3 @@
-
-### fixed-v3
-- Fixed startup `sed` invocation so the DNSCrypt `server_names` setting is edited in-place with `sed -i`.
-# Changelog
-- Fixed the Docker build to checkout the upstream `2.1.18` tag without adding a non-existent `v` prefix.
-
 All notable changes to this SnapDeploy Docker deployment are documented here.
 
 ## [1.1.0] - 2026-09-16
@@ -46,4 +40,4 @@ All notable changes to this SnapDeploy Docker deployment are documented here.
 - Initial dnscrypt-proxy 2 Docker deployment for SnapDeploy.
 - Local DoH gateway at `/dns-query`.
 - Health endpoint at `/healthz`.
-- Environment-driven resolver selection.
+- Environment-driven resolver selec
