@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -9,8 +10,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -25,6 +29,53 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func envInt(key string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
+}
+
+// limitListener caps the number of simultaneously open connections. On a
+// 0.25 vCPU / 512MB service this is cheap insurance against a connection
+// flood exhausting file descriptors or goroutine memory; it does not limit
+// query throughput, only how many TCP connections can be open at once.
+type limitListener struct {
+	net.Listener
+	sem chan struct{}
+}
+
+func newLimitListener(l net.Listener, maxConns int) net.Listener {
+	return &limitListener{Listener: l, sem: make(chan struct{}, maxConns)}
+}
+
+func (l *limitListener) Accept() (net.Conn, error) {
+	l.sem <- struct{}{}
+	c, err := l.Listener.Accept()
+	if err != nil {
+		<-l.sem
+		return nil, err
+	}
+	return &limitListenerConn{Conn: c, release: l.sem}, nil
+}
+
+type limitListenerConn struct {
+	net.Conn
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *limitListenerConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() { <-c.release })
+	return err
 }
 
 func decodeQuery(v string) ([]byte, error) {
@@ -124,7 +175,14 @@ func dnsExchange(addr string, q []byte) ([]byte, error) {
 	return response, nil
 }
 
-func dohHandler(upstream, path string, maxBody int) http.HandlerFunc {
+func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFunc {
+	// Bounds how many DNS exchanges run concurrently, independent of how many
+	// HTTP connections are open. This is the gateway's own backpressure to
+	// match dnscrypt-proxy's max_clients on the loopback side: once the limit
+	// is hit, new requests get a fast 503 instead of queuing up behind a
+	// resolver that's already at capacity.
+	inflight := make(chan struct{}, maxInflight)
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -161,6 +219,14 @@ func dohHandler(upstream, path string, maxBody int) http.HandlerFunc {
 				http.Error(w, "invalid dns query encoding", http.StatusBadRequest)
 				return
 			}
+			if len(query) == 0 {
+				http.Error(w, "empty DNS message", http.StatusBadRequest)
+				return
+			}
+			if len(query) > maxDNSPacket {
+				http.Error(w, "DNS message too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 		case http.MethodPost:
 			if maxBody <= 0 || maxBody > maxDNSPacket {
 				maxBody = maxDNSPacket
@@ -173,6 +239,11 @@ func dohHandler(upstream, path string, maxBody int) http.HandlerFunc {
 			var err error
 			query, err = io.ReadAll(r.Body)
 			if err != nil {
+				var tooLarge *http.MaxBytesError
+				if errors.As(err, &tooLarge) {
+					http.Error(w, "DNS message too large", http.StatusRequestEntityTooLarge)
+					return
+				}
 				http.Error(w, "failed to read dns message", http.StatusBadRequest)
 				return
 			}
@@ -189,6 +260,15 @@ func dohHandler(upstream, path string, maxBody int) http.HandlerFunc {
 		default:
 			w.Header().Set("Allow", "GET, POST, OPTIONS")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		select {
+		case inflight <- struct{}{}:
+			defer func() { <-inflight }()
+		default:
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "gateway at capacity, retry shortly", http.StatusServiceUnavailable)
 			return
 		}
 
@@ -216,6 +296,8 @@ func main() {
 	if maxBody <= 0 || maxBody > maxDNSPacket {
 		maxBody = maxDNSPacket
 	}
+	maxInflight := envInt("DOH_MAX_INFLIGHT", 64)
+	maxConns := envInt("DOH_MAX_CONNS", 512)
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
@@ -226,17 +308,41 @@ func main() {
 	addr := net.JoinHostPort(bindHost, port)
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           dohHandler(upstream, path, maxBody),
+		Handler:           dohHandler(upstream, path, maxBody, maxInflight),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       readTimeout,
 		WriteTimeout:      writeTimeout,
 		IdleTimeout:       30 * time.Second,
 	}
 
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatal(fmt.Errorf("DoH gateway: listen: %w", err))
+	}
+	ln = newLimitListener(ln, maxConns)
+
 	log.Printf("DoH gateway listening on http://%s%s -> %s", addr, path, upstream)
 	log.Printf("health endpoint: http://%s/healthz", net.JoinHostPort(bindHost, port))
+	log.Printf("limits: max %d in-flight exchanges, max %d connections", maxInflight, maxConns)
 
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(fmt.Errorf("DoH gateway: %w", err))
+	// Shut down cleanly on SIGTERM/SIGINT (e.g. from start.sh's cleanup trap)
+	// instead of connections being cut abruptly.
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ln) }()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+
+	select {
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(fmt.Errorf("DoH gateway: %w", err))
+		}
+	case <-sig:
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("DoH gateway: shutdown: %v", err)
+		}
 	}
 }
