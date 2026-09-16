@@ -1,5 +1,47 @@
 All notable changes to this SnapDeploy Docker deployment are documented here.
 
+## [1.3.0] - 2026-09-17
+
+### Fixed
+
+- **Corrects a documentation/reality gap from 1.2.0.** That entry described
+  `.dockerignore`, `.env.example`, and a real `.gitignore` as already added,
+  but none had actually landed in the shipped files: `.dockerignore` and
+  `.env.example` were missing entirely, and `.gitignore` was still the
+  unrelated Ada/object-file template. All three are genuinely present now.
+- **Split the shared `GOMEMLIMIT` between the two Go processes.**
+  `GOMEMLIMIT` is a *per-runtime* soft target, not a container-wide one, so
+  the single `GOMEMLIMIT=300MiB` env var let `dnscrypt-proxy` and
+  `doh-gateway` each independently grow toward 300MiB — up to ~600MB
+  combined, over the 512MB hard limit. Replaced with `DNSCRYPT_GOMEMLIMIT`
+  (default `360MiB`) and `DOH_GOMEMLIMIT` (default `48MiB`), applied
+  separately in `start.sh` when each binary is launched.
+- **Fixed misleading DoH error codes.** An oversized or empty GET query
+  (`?dns=`) fell through to `dnsExchange`'s internal size check and surfaced
+  as a generic `502 upstream DNS failure`. It's now validated up front and
+  returns `400`/`413` like the POST path already did. Also fixed POST so a
+  body that exceeds `DOH_MAX_BODY` while being *read* (as opposed to a
+  `Content-Length` that's already too large) returns `413` instead of a
+  generic `400`.
+
+### Added
+
+- `doh-gateway` now caps its own concurrency (`DOH_MAX_INFLIGHT`, default
+  `64`, matching dnscrypt-proxy's `max_clients`) and open connections
+  (`DOH_MAX_CONNS`, default `512`), both implemented without new
+  dependencies. Past either limit, new requests get a fast `503` instead of
+  piling up goroutines on the 0.25 vCPU budget.
+- `doh-gateway` now shuts down gracefully on `SIGTERM`/`SIGINT`, letting
+  in-flight requests finish instead of cutting them off.
+
+### Changed
+
+- Commented out `netprobe_address` in `config/dnscrypt-proxy.toml`: with
+  `netprobe_timeout = 0`, the startup probe is skipped entirely, making the
+  address setting dead configuration.
+- Updated `README.md`'s runtime-settings table and resource-profile section
+  to document the new variables and explain the GOMEMLIMIT split.
+
 ## [1.2.0] - 2026-09-17
 
 ### Fixed

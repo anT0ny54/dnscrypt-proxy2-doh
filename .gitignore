@@ -1,5 +1,28 @@
-# Object file
-*.o
+# Go build artifacts
+/out/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
 
-# Ada Library Information
-*.ali
+# Go module/build caches, if ever run outside Docker
+/doh-gateway/vendor/
+
+# dnscrypt-proxy source is cloned by the Dockerfile build stage, not vendored
+/dnscrypt-proxy/
+
+# Local environment overrides copied from .env.example
+.env
+.env.*
+!.env.example
+
+# Editor/OS cruft
+.DS_Store
+*.swp
+*~
+
+# Local container/runtime scratch, if the image is ever run outside Docker
+/cache/
+*.log

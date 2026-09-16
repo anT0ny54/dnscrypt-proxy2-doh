@@ -1,0 +1,19 @@
+.git
+.github
+.gitignore
+.dockerignore
+.env
+.env.*
+!.env.example
+
+*.md
+LICENSE
+
+# Never ship a local dnscrypt-proxy checkout or Go build cache into the
+# build context -- the Dockerfile clones the pinned upstream tag itself.
+/dnscrypt-proxy/
+/out/
+/doh-gateway/vendor/
+
+*.log
+.DS_Store
