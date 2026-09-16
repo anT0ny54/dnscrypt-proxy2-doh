@@ -51,7 +51,7 @@ doh_path="${DOH_PATH:-/dns-query}"
 doh_bind="${DOH_BIND:-0.0.0.0}"
 # Optional public URL shown in startup logs/documentation. Replace this value with
 # the hostname assigned by SnapDeploy. It does not control DNS routing.
-PUBLIC_DOH_URL="${PUBLIC_DOH_URL:-https://dp-0a3e2.containers.snapdeploy.app/dns-query}"
+PUBLIC_DOH_URL="${PUBLIC_DOH_URL:-https://dp-871de.containers.snapdeploy.app/dns-query}"
 
 echo "Starting dnscrypt-proxy 2 + DoH gateway"
 echo "  dnscrypt-proxy : $dns_listen"
