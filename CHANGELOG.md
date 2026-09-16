@@ -1,3 +1,9 @@
+## SnapDeploy DoH compatibility fix
+
+- Added OPTIONS handling and CORS headers for browser-based DoH diagnostics.
+- Added a short resolver startup grace period before exposing the DoH gateway.
+- Keeps SnapDeploy public HTTPS termination and binds the gateway to `0.0.0.0:${PORT}`.
+
 All notable changes to this SnapDeploy Docker deployment are documented here.
 
 ## [1.1.0] - 2026-09-16

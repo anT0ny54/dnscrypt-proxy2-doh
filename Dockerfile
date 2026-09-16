@@ -38,6 +38,7 @@ COPY start.sh /usr/local/bin/start.sh
 RUN chmod 0755 /usr/local/bin/start.sh /usr/local/bin/dnscrypt-proxy /usr/local/bin/doh-gateway
 
 ENV PORT=8080 \
+    DOH_BIND=0.0.0.0 \
     DNS_LISTEN=127.0.0.1:5300 \
     DOH_PATH=/dns-query \
     DOH_UPSTREAM_ADDR=127.0.0.1:5300 \

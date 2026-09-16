@@ -42,6 +42,7 @@ Create a Docker service from this repository. Set the environment variables belo
 
 ```text
 DOH_PATH=/dns-query
+DOH_BIND=0.0.0.0
 DNS_LISTEN=127.0.0.1:5300
 DOH_MAX_BODY=65535
 ```
@@ -51,7 +52,7 @@ DOH_MAX_BODY=65535
 After deployment, the public resolver URL is:
 
 ```text
-https://<your-snapdeploy-domain>/dns-query
+https://<your-container-id>.containers.snapdeploy.app/dns-query
 ```
 
 Health check:
@@ -96,6 +97,7 @@ For a real DoH client, place the container behind HTTPS/TLS and use `/dns-query`
 | Variable | Default | Purpose |
 |---|---|---|
 | `DOH_PATH` | `/dns-query` | Public DoH path |
+| `DOH_BIND` | `0.0.0.0` | Container interface for the SnapDeploy HTTP service |
 | `DNS_LISTEN` | `127.0.0.1:5300` | Local DNS listener used by the gateway |
 | `DOH_UPSTREAM_ADDR` | `127.0.0.1:5300` | Gateway's local DNS target |
 | `DOH_MAX_BODY` | `65535` | Maximum DoH POST body size in bytes |
@@ -154,3 +156,23 @@ These settings keep the service small without disabling the core encrypted-DoH f
 ## Updating dnscrypt-proxy
 
 Change `DNSCRYPT_VERSION` in the Dockerfile, review the upstream release notes, rebuild, and test the resolver names before deploying. The pinned release is deliberate so a platform rebuild does not unexpectedly move to a different upstream version. The current upstream release page lists 2.1.18 as the latest tagged release in the checked source.
+
+
+## Important: public SnapDeploy URL
+
+Use the exact hostname assigned to the deployed container. `https://*.containers.snapdeploy.app/dns-query` is not a valid client endpoint because `*` is only a wildcard pattern.
+
+## SnapDeploy
+
+For SnapDeploy, use the hostname assigned to the deployed container. Set `PUBLIC_DOH_URL` to that URL if you want it displayed in the startup log. Example:
+
+```text
+PUBLIC_DOH_URL=https://dp-6441d.containers.snapdeploy.app/dns-query
+```
+
+Replace only `YOUR-CONTAINER-NAME` with the actual hostname shown by SnapDeploy. The gateway listens on `0.0.0.0:${PORT}` and serves `/dns-query`; SnapDeploy should terminate public HTTPS and forward the assigned service port to the container.
+
+
+
+## Testing the public DoH endpoint
+Opening `/dns-query` in a normal browser is not a valid DoH test and may return HTTP 400 because no DNS message was supplied. Test with a DoH-capable client or send an RFC 8484 DNS message using GET (`?dns=`) or POST (`Content-Type: application/dns-message`). The root URL `/` returns a simple diagnostic page.

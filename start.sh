@@ -38,18 +38,34 @@ sed -i \
 mkdir -p "$CONFIG_DIR/cache" /var/log/dnscrypt-proxy
 chown -R dnscrypt:dnscrypt "$CONFIG_DIR" /var/log/dnscrypt-proxy
 
+# Validate the final runtime configuration before starting the resolver.
+# dnscrypt-proxy supports -check and exits non-zero on invalid TOML/stamps.
+echo "Checking dnscrypt-proxy configuration..."
+if ! "$DNSCRYPT_BIN" -config "$CONFIG_FILE" -check; then
+    echo "ERROR: dnscrypt-proxy configuration check failed." >&2
+    exit 1
+fi
+
 port="${PORT:-8080}"
 doh_path="${DOH_PATH:-/dns-query}"
+doh_bind="${DOH_BIND:-0.0.0.0}"
+# Optional public URL shown in startup logs/documentation. Replace this value with
+# the hostname assigned by SnapDeploy. It does not control DNS routing.
+PUBLIC_DOH_URL="${PUBLIC_DOH_URL:-https://dp-6441d.containers.snapdeploy.app/dns-query}"
 
 echo "Starting dnscrypt-proxy 2 + DoH gateway"
 echo "  dnscrypt-proxy : $dns_listen"
 echo "  server_names   : $server_names (static-only)"
-echo "  DoH endpoint   : :$port$doh_path"
+echo "  DoH endpoint   : ${doh_bind}:$port$doh_path"
+echo "  Public DoH URL : $PUBLIC_DOH_URL"
 echo "  memory target  : 512 MB"
 echo "  CPU target     : 0.25 vCPU"
 
 # Keep dnscrypt-proxy as a child so the shell can stop both processes cleanly.
-su-exec dnscrypt "$DNSCRYPT_BIN" -config "$CONFIG_FILE" &
+DNSCRYPT_LOG=/var/log/dnscrypt-proxy/dnscrypt-proxy-runtime.log
+: > "$DNSCRYPT_LOG"
+chown dnscrypt:dnscrypt "$DNSCRYPT_LOG"
+su-exec dnscrypt "$DNSCRYPT_BIN" -config "$CONFIG_FILE" >"$DNSCRYPT_LOG" 2>&1 &
 dns_pid=$!
 doh_pid=0
 
@@ -64,8 +80,28 @@ cleanup() {
 }
 trap cleanup INT TERM HUP EXIT
 
-# Let dnscrypt-proxy initialize before the HTTP listener becomes reachable.
-sleep 1
+# Wait until dnscrypt-proxy is actually accepting TCP queries.
+# Checking only that the process exists can mark the container healthy even when
+# the resolver has failed to bind or has not finished initializing.
+ready=0
+for i in $(seq 1 30); do
+    if ! kill -0 "$dns_pid" 2>/dev/null; then
+        break
+    fi
+    dns_host=${dns_listen%:*}
+    dns_port=${dns_listen##*:}
+    if busybox nc -z -w 1 "$dns_host" "$dns_port" >/dev/null 2>&1; then
+        ready=1
+        break
+    fi
+    sleep 1
+done
+if [ "$ready" -ne 1 ]; then
+    echo "ERROR: dnscrypt-proxy is not accepting TCP on $dns_listen within 30s." >&2
+    echo "Last resolver log:" >&2
+    tail -n 80 "$DNSCRYPT_LOG" >&2 || true
+    exit 1
+fi
 
 "$DOH_BIN" &
 doh_pid=$!
@@ -75,7 +111,8 @@ doh_pid=$!
 while :; do
     if ! kill -0 "$dns_pid" 2>/dev/null; then
         wait "$dns_pid" 2>/dev/null || true
-        echo "ERROR: dnscrypt-proxy exited unexpectedly." >&2
+        echo "ERROR: dnscrypt-proxy exited unexpectedly. Last resolver log:" >&2
+        tail -n 80 "$DNSCRYPT_LOG" >&2 || true
         exit 1
     fi
     if ! kill -0 "$doh_pid" 2>/dev/null; then
