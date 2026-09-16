@@ -16,8 +16,11 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags='-s -w' -o /out/dnscrypt-proxy ./dnscrypt-proxy
 
 COPY doh-gateway /src/doh-gateway
+# doh-gateway is a separate Go module, so build from its module directory.
+WORKDIR /src/doh-gateway
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags='-s -w' -o /out/doh-gateway ./doh-gateway
+    go build -trimpath -ldflags='-s -w' -o /out/doh-gateway .
+WORKDIR /src
 
 FROM alpine:3.22
 
