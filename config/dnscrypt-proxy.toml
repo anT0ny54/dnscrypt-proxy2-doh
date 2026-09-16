@@ -553,4 +553,461 @@ cache_neg_max_ttl = 600
 
 [query_log]
 
-## Path to the
+## Path to the query log file (absolute, or relative to the same directory as the config file)
+## Can be set to /dev/stdout in order to log to the standard output.
+
+# file = 'query.log'
+
+
+## Query log format (currently supported: tsv and ltsv)
+##
+## TSV format columns: timestamp, client_ip, query_name, query_type, return_code, duration, server, relay
+## LTSV format fields: time, host, message, type, return, cached, duration, server, relay
+##
+## The relay field shows the anonymizing relay name when using Anonymized DNS or ODoH,
+## or "-" when no relay is used.
+
+format = 'tsv'
+
+
+## Do not log these query types, to reduce verbosity. Keep empty to log everything.
+
+# ignored_qtypes = ['DNSKEY', 'NS']
+
+
+###############################################################################
+#                        Suspicious queries logging                            #
+###############################################################################
+
+[nx_log]
+
+## Log queries for nonexistent zones
+## These queries can reveal the presence of malware, broken/obsolete applications,
+## and devices signaling their presence to 3rd parties.
+
+## Path to the query log file (absolute, or relative to the same directory as the config file)
+
+# file = 'nx.log'
+
+
+## Query log format (currently supported: tsv and ltsv)
+
+format = 'tsv'
+
+
+###############################################################################
+#                    Pattern-based blocking (blocklists)                       #
+###############################################################################
+
+## Blocklists are made of one pattern per line. Example of valid patterns:
+##
+##   example.com
+##   =example.com
+##   *sex*
+##   ads.*
+##   ads*.example.*
+##   ads*.example[0-9]*.com
+##
+## Example blocklist files can be found at https://download.dnscrypt.info/blocklists/
+## A script to build blocklists from public feeds can be found in the
+## `utils/generate-domains-blocklists` directory of the dnscrypt-proxy source code.
+
+[blocked_names]
+
+## Path to the file of blocking rules (absolute, or relative to the same directory as the config file)
+
+# blocked_names_file = 'blocked-names.txt'
+
+
+## Optional path to a file logging blocked queries
+
+# log_file = 'blocked-names.log'
+
+
+## Optional log format: tsv or ltsv (default: tsv)
+
+# log_format = 'tsv'
+
+
+###############################################################################
+#                  Pattern-based IP blocking (IP blocklists)                   #
+###############################################################################
+
+## IP blocklists are made of one pattern per line. Example of valid patterns:
+##
+##   127.*
+##   fe80:abcd:*
+##   192.168.1.4
+
+[blocked_ips]
+
+## Path to the file of blocking rules (absolute, or relative to the same directory as the config file)
+
+# blocked_ips_file = 'blocked-ips.txt'
+
+
+## Optional path to a file logging blocked queries
+
+# log_file = 'blocked-ips.log'
+
+
+## Optional log format: tsv or ltsv (default: tsv)
+
+# log_format = 'tsv'
+
+
+###############################################################################
+#                 Pattern-based allow lists (blocklists bypass)                #
+###############################################################################
+
+## Allowlists support the same patterns as blocklists
+## If a name matches an allowlist entry, the corresponding session
+## will bypass names and IP filters.
+##
+## Time-based rules are also supported to make some websites only accessible at specific times of the day.
+
+[allowed_names]
+
+## Path to the file of allow list rules (absolute, or relative to the same directory as the config file)
+
+# allowed_names_file = 'allowed-names.txt'
+
+
+## Optional path to a file logging allowed queries
+
+# log_file = 'allowed-names.log'
+
+
+## Optional log format: tsv or ltsv (default: tsv)
+
+# log_format = 'tsv'
+
+
+###############################################################################
+#           Pattern-based allowed IPs lists (blocklists bypass)                #
+###############################################################################
+
+## Allowed IP lists support the same patterns as IP blocklists
+## If an IP response matches an allowed entry, the corresponding session
+## will bypass IP filters.
+
+[allowed_ips]
+
+## Path to the file of allowed ip rules (absolute, or relative to the same directory as the config file)
+
+# allowed_ips_file = 'allowed-ips.txt'
+
+
+## Optional path to a file logging allowed queries
+
+# log_file = 'allowed-ips.log'
+
+## Optional log format: tsv or ltsv (default: tsv)
+
+# log_format = 'tsv'
+
+
+###############################################################################
+#                        Time access restrictions                              #
+###############################################################################
+
+## One or more weekly schedules can be defined here.
+## Patterns in the name-based blocked_names file can optionally be followed with @schedule_name
+## to apply the pattern 'schedule_name' only when it matches a time range of that schedule.
+##
+## For example, the following rule in a blocklist file:
+## *.youtube.* @time-to-sleep
+## would block access to YouTube during the times defined by the 'time-to-sleep' schedule.
+##
+## {after='21:00', before= '7:00'} matches 0:00-7:00 and 21:00-0:00
+## {after= '9:00', before='18:00'} matches 9:00-18:00
+
+[schedules]
+
+# [schedules.time-to-sleep]
+#   mon = [{after='21:00', before='7:00'}]
+#   tue = [{after='21:00', before='7:00'}]
+#   wed = [{after='21:00', before='7:00'}]
+#   thu = [{after='21:00', before='7:00'}]
+#   fri = [{after='23:00', before='7:00'}]
+#   sat = [{after='23:00', before='7:00'}]
+#   sun = [{after='21:00', before='7:00'}]
+
+# [schedules.work]
+#   mon = [{after='9:00', before='18:00'}]
+#   tue = [{after='9:00', before='18:00'}]
+#   wed = [{after='9:00', before='18:00'}]
+#   thu = [{after='9:00', before='18:00'}]
+#   fri = [{after='9:00', before='17:00'}]
+
+
+###############################################################################
+#                                Servers                                       #
+###############################################################################
+
+## Remote lists of available servers
+## Multiple sources can be used simultaneously, but every source
+## requires a dedicated cache file.
+##
+## Refer to the documentation for URLs of public sources.
+##
+## A prefix can be prepended to server names in order to
+## avoid collisions if different sources share the same names for
+## different servers. In that case, names listed in `server_names`
+## must include the prefixes.
+##
+## If the `urls` property is missing, cache files and valid signatures
+## must already be present. This doesn't prevent these cache files from
+## expiring after `cache_ttl` hours.
+##
+## `refresh_delay` controls how often to download updates during normal operation.
+## Must be in the [25..169] interval; values outside that range are clamped.
+##
+## `cache_ttl` controls how old the cache can be at startup before requiring
+## an immediate download. Defaults to 168 hours if not set.
+## Must be in [refresh_delay..168] interval.
+
+[sources]
+
+# Remote resolver sources are intentionally disabled.
+# This deployment is fully self-contained and uses only the three static
+# HaGeZi resolvers defined at the end of this file.
+
+
+###############################################################################
+#                        Servers with known bugs                               #
+###############################################################################
+
+[broken_implementations]
+
+## Cisco servers currently cannot handle queries larger than 1472 bytes, and don't
+## truncate responses larger than questions as expected by the DNSCrypt protocol.
+## This prevents large responses from being received over UDP and over relays.
+##
+## Older versions of the `dnsdist` server software had a bug with queries larger
+## than 1500 bytes. This is fixed since `dnsdist` version 1.5.0, but
+## some servers may still run an outdated version.
+##
+## The list below enables workarounds to make non-relayed usage more reliable
+## until the servers are fixed.
+
+fragments_blocked = [
+  'cisco',
+  'cisco-ipv6',
+  'cisco-familyshield',
+  'cisco-familyshield-ipv6',
+  'cisco-sandbox',
+  'cleanbrowsing-adult',
+  'cleanbrowsing-adult-ipv6',
+  'cleanbrowsing-family',
+  'cleanbrowsing-family-ipv6',
+  'cleanbrowsing-security',
+  'cleanbrowsing-security-ipv6',
+]
+
+
+###############################################################################
+#                Certificate-based client authentication for DoH               #
+###############################################################################
+
+[doh_client_x509_auth]
+
+## Use an X509 certificate to authenticate yourself when connecting to DoH servers.
+## This is only useful if you are operating your own, private DoH server(s).
+## 'creds' maps servers to certificates, and supports multiple entries.
+## If you are not using the standard root CA, an optional "root_ca"
+## property set to the path to a root CRT file can be added to a server entry.
+
+# creds = [
+#    { server_name='*', client_cert='client.crt', client_key='client.key' }
+# ]
+
+
+###############################################################################
+#                          Anonymized DNS                                      #
+###############################################################################
+
+[anonymized_dns]
+
+## Routes are indirect ways to reach DNSCrypt servers.
+##
+## A route maps a server name ("server_name") to one or more relays that will be
+## used to connect to that server.
+##
+## A relay can be specified as a DNS Stamp (either a relay stamp, or a
+## DNSCrypt stamp) or a server name.
+##
+## The following example routes "example-server-1" via `anon-example-1` or `anon-example-2`,
+## and "example-server-2" via the relay whose relay DNS stamp is
+## "sdns://gRIxMzcuNzQuMjIzLjIzNDo0NDM".
+##
+## !!! THESE ARE JUST EXAMPLES !!!
+##
+## Review the list of available relays from the "relays.md" file, and, for each
+## server you want to use, define the relays you want connections to go through.
+##
+## Carefully choose relays and servers so that they are run by different entities.
+##
+## "server_name" can also be set to "*" to define a default route, for all servers:
+## { server_name='*', via=['anon-example-1', 'anon-example-2'] }
+##
+## If a route is ["*"], the proxy automatically picks a relay on a distinct network.
+## { server_name='*', via=['*'] } is also an option, but is likely to be suboptimal.
+##
+## Manual selection is always recommended over automatic selection, so that you can
+## select (relay,server) pairs that work well and fit your own criteria (close by or
+## in different countries, operated by different entities, on distinct ISPs...)
+
+# routes = [
+#    { server_name='example-server-1', via=['anon-example-1', 'anon-example-2'] },
+#    { server_name='example-server-2', via=['sdns://gRIxMzcuNzQuMjIzLjIzNDo0NDM'] }
+# ]
+
+
+## Skip resolvers incompatible with anonymization instead of using them directly
+
+skip_incompatible = false
+
+
+## If public server certificates for a non-conformant server cannot be
+## retrieved via a relay, try getting them directly. Actual queries
+## will then always go through relays.
+
+# direct_cert_fallback = true
+
+
+###############################################################################
+#                                 DNS64                                        #
+###############################################################################
+
+[dns64]
+
+## DNS64 is a mechanism for synthesizing AAAA records from A records.
+## It is used with an IPv6/IPv4 translator to enable client-server
+## communication between an IPv6-only client and an IPv4-only server,
+## without requiring any changes to either the IPv6 or the IPv4 node,
+## for the class of applications that work through NATs.
+##
+## There are two options to synthesize such records:
+## Option 1: Using a set of static IPv6 prefixes;
+## Option 2: By discovering the IPv6 prefix from DNS64-enabled resolver.
+##
+## If both options are configured - only static prefixes are used.
+## (Ref. RFC6147, RFC6052, RFC7050)
+##
+## Do not enable unless you know what DNS64 is and why you need it, or else
+## you won't be able to connect to anything at all.
+
+## Static prefix(es) as Pref64::/n CIDRs
+
+# prefix = ['64:ff9b::/96']
+
+## DNS64-enabled resolver(s) to discover Pref64::/n CIDRs
+## These resolvers are used to query for Well-Known IPv4-only Name (WKN) "ipv4only.arpa." to discover only.
+## Set with your ISP's resolvers in case of custom prefixes (other than Well-Known Prefix 64:ff9b::/96).
+## IMPORTANT: Default resolvers listed below support Well-Known Prefix 64:ff9b::/96 only.
+
+# resolver = ['[2606:4700:4700::64]:53', '[2001:4860:4860::64]:53']
+
+
+###############################################################################
+#                           IP Encryption                                      #
+###############################################################################
+
+[ip_encryption]
+
+## Encrypt client IP addresses in plugin logs using IPCrypt
+## This provides privacy for client IP addresses while maintaining
+## the ability to distinguish between different clients in logs
+
+## Encryption algorithm (default: "none")
+## - "none": No encryption (default)
+## - "ipcrypt-deterministic": Deterministic encryption (same IP always encrypts to same value) - requires 16-byte key
+## - "ipcrypt-nd": Non-deterministic encryption with 8-byte tweak - requires 16-byte key
+## - "ipcrypt-ndx": Non-deterministic encryption with 16-byte tweak (extended) - requires 32-byte key
+## - "ipcrypt-pfx": Prefix-preserving encryption (preserves network prefix relationships) - requires 32-byte key
+
+algorithm = "none"
+
+## Encryption key in hexadecimal format (required if algorithm is not "none")
+## Key size depends on algorithm:
+## - ipcrypt-deterministic: 32 hex chars (16 bytes) - Generate with: openssl rand -hex 16
+## - ipcrypt-nd: 32 hex chars (16 bytes) - Generate with: openssl rand -hex 16
+## - ipcrypt-ndx: 64 hex chars (32 bytes) - Generate with: openssl rand -hex 32
+## - ipcrypt-pfx: 64 hex chars (32 bytes) - Generate with: openssl rand -hex 32
+## Example for deterministic/nd: key = "1234567890abcdef1234567890abcdef"
+## Example for ndx: key = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+## IMPORTANT: Keep this key secret
+
+key = ""
+
+
+###############################################################################
+#                            Monitoring UI                                     #
+###############################################################################
+
+[monitoring_ui]
+
+## Enable the monitoring UI
+enabled = false
+
+## Listen address for the monitoring UI
+listen_address = "127.0.0.1:8080"
+
+## Optional username and password for basic authentication
+## To disable authentication, set username to an empty string: username = ""
+## If both username and password are empty, no authentication is required
+username = "admin"
+password = "changeme"
+
+## Optional TLS certificate and key for HTTPS
+## If both are empty, HTTP will be used
+tls_certificate = ""
+tls_key = ""
+
+## Enable query logging in the monitoring UI
+## This will show recent queries in the UI
+enable_query_log = true
+
+## Privacy level for the monitoring UI
+## 0: show all details including client IPs
+## 1: anonymize client IPs
+## 2: aggregate data only (no individual queries or domains shown) (default)
+privacy_level = 1
+
+## Maximum number of recent query log entries to keep in memory
+## Helps control memory usage on high-traffic servers
+## Default: 100
+# max_query_log_entries = 100
+
+## Maximum memory usage in MB for recent query logs
+## Automatic cleanup when limit is exceeded
+## Default: 1
+# max_memory_mb = 1
+
+## Enable Prometheus metrics endpoint
+## Default: false
+# prometheus_enabled = false
+
+## Path for Prometheus metrics endpoint
+## Default: /metrics
+# prometheus_path = "/metrics"
+
+
+###############################################################################
+#                            Static entries                                    #
+###############################################################################
+
+[static]
+
+## Optional, local, static list of additional servers
+## Mostly useful for testing your own servers.
+
+[static.HaGeZiDNS1]
+stamp = 'sdns://AgMAAAAAAAAADjE4OC4zNC4xNjEuMjEwABdodHRwczovL3Jvb3QuaGFnZXppLm9yZwovZG5zLXF1ZXJ5'
+
+[static.HaGeZiDNS2]
+stamp = 'sdns://AgMAAAAAAAAADTE1OS42OS4xNTUuOTQAGGh0dHBzOi8vd3Vyem4uaGFnZXppLm9yZwovZG5zLXF1ZXJ5'
+
+[static.HaGeZiDNS3]
+stamp = 'sdns://AgMAAAAAAAAADTk1LjIxNy4xNjMuMTcAGGh0dHBzOi8vanV1cmkuaGFnZXppLm9yZwovZG5zLXF1ZXJ5'
