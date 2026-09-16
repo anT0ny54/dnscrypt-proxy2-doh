@@ -133,6 +133,15 @@ func dohHandler(upstream, path string, maxBody int) http.HandlerFunc {
 			return
 		}
 
+		// Human/browser diagnostic. A browser opening /dns-query without a DNS
+		// message is not a valid DoH request, so make that case explicit.
+		if r.URL.Path == "/" {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "dnscrypt-proxy DoH gateway\nPOST or GET /dns-query with a DNS message\n")
+			return
+		}
+
 		if r.URL.Path != path {
 			http.NotFound(w, r)
 			return
@@ -171,8 +180,14 @@ func dohHandler(upstream, path string, maxBody int) http.HandlerFunc {
 				http.Error(w, "empty DNS message", http.StatusBadRequest)
 				return
 			}
+		case http.MethodOptions:
+			w.Header().Set("Allow", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept")
+			w.WriteHeader(http.StatusNoContent)
+			return
 		default:
-			w.Header().Set("Allow", "GET, POST")
+			w.Header().Set("Allow", "GET, POST, OPTIONS")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
@@ -186,6 +201,7 @@ func dohHandler(upstream, path string, maxBody int) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/dns-message")
 		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(response)
@@ -204,7 +220,10 @@ func main() {
 		path = "/" + path
 	}
 
-	addr := ":" + port
+	// SnapDeploy terminates public HTTPS and forwards HTTP to the container.
+	// Bind on all interfaces so the platform can reach the service port.
+	bindHost := env("DOH_BIND", "0.0.0.0")
+	addr := net.JoinHostPort(bindHost, port)
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           dohHandler(upstream, path, maxBody),
@@ -214,8 +233,8 @@ func main() {
 		IdleTimeout:       30 * time.Second,
 	}
 
-	log.Printf("DoH gateway listening on %s%s -> %s", addr, path, upstream)
-	log.Printf("health endpoint: http://0.0.0.0:%s/healthz", port)
+	log.Printf("DoH gateway listening on http://%s%s -> %s", addr, path, upstream)
+	log.Printf("health endpoint: http://%s/healthz", net.JoinHostPort(bindHost, port))
 
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(fmt.Errorf("DoH gateway: %w", err))
