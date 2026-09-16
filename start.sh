@@ -31,7 +31,7 @@ IFS=$old_ifs
 
 # Write only the runtime-controlled values; keep the rest of the pinned config immutable.
 sed -i \
-    "s#^server_names = .*#server_names = [$toml_names]#" \
+    -e "s#^server_names = .*#server_names = [$toml_names]#" \
     -e "s#^listen_addresses = .*#listen_addresses = ['$dns_listen']#" \
     "$CONFIG_FILE"
 
