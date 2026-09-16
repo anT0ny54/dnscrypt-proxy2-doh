@@ -185,13 +185,13 @@ keepalive = 10
 ## 'random': Randomly choose from all servers.
 ## The response quality still depends on the server itself.
 
-# lb_strategy = 'wp2'
+lb_strategy = 'p2'
 
 ## Set to `true` to constantly try to estimate the latency of all the resolvers
 ## and adjust the load-balancing parameters accordingly, or to `false` to disable.
 ## Default is `true`, which makes the `wp2` `lb_strategy` work well.
 
-# lb_estimator = true
+lb_estimator = true
 
 ## Dynamically reduce query timeout as the number of concurrent connections
 ## approaches max_clients to prevent overload. Value must be between 0.0 and 1.0.
