@@ -1,0 +1,223 @@
+package main
+
+import (
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	maxDNSPacket = 65535
+	readTimeout  = 5 * time.Second
+	writeTimeout = 5 * time.Second
+)
+
+func env(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func decodeQuery(v string) ([]byte, error) {
+	v = strings.TrimSpace(v)
+	encs := []*base64.Encoding{
+		base64.RawURLEncoding,
+		base64.URLEncoding,
+		base64.RawStdEncoding,
+		base64.StdEncoding,
+	}
+	var last error
+	for _, enc := range encs {
+		b, err := enc.DecodeString(v)
+		if err == nil {
+			return b, nil
+		}
+		last = err
+	}
+	return nil, last
+}
+
+func dnsExchangeUDP(addr string, q []byte) ([]byte, error) {
+	conn, err := net.DialTimeout("udp", addr, readTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	_ = conn.SetDeadline(time.Now().Add(readTimeout))
+	if _, err := conn.Write(q); err != nil {
+		return nil, err
+	}
+
+	buf := make([]byte, maxDNSPacket)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+	if n < 12 {
+		return nil, errors.New("short DNS response")
+	}
+	return buf[:n], nil
+}
+
+func dnsExchangeTCP(addr string, q []byte) ([]byte, error) {
+	conn, err := net.DialTimeout("tcp", addr, readTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(readTimeout))
+
+	if len(q) > 0xffff {
+		return nil, errors.New("DNS message too large for TCP")
+	}
+	frame := []byte{byte(len(q) >> 8), byte(len(q))}
+	frame = append(frame, q...)
+	if _, err := conn.Write(frame); err != nil {
+		return nil, err
+	}
+
+	var hdr [2]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		return nil, err
+	}
+	n := int(hdr[0])<<8 | int(hdr[1])
+	if n <= 0 || n > maxDNSPacket {
+		return nil, errors.New("invalid TCP DNS response size")
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return nil, err
+	}
+	if len(buf) < 12 {
+		return nil, errors.New("short DNS response")
+	}
+	return buf, nil
+}
+
+func dnsExchange(addr string, q []byte) ([]byte, error) {
+	if len(q) == 0 || len(q) > maxDNSPacket {
+		return nil, errors.New("invalid DNS message size")
+	}
+
+	// Use UDP for the common case. If the upstream response is truncated (TC=1),
+	// retry over TCP on the same local dnscrypt-proxy listener.
+	response, udpErr := dnsExchangeUDP(addr, q)
+	if udpErr == nil && len(response) >= 4 && (response[2]&0x02) != 0 {
+		tcpResponse, err := dnsExchangeTCP(addr, q)
+		if err == nil {
+			return tcpResponse, nil
+		}
+	}
+	if udpErr != nil {
+		return dnsExchangeTCP(addr, q)
+	}
+	return response, nil
+}
+
+func dohHandler(upstream, path string, maxBody int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "ok\n")
+			return
+		}
+
+		if r.URL.Path != path {
+			http.NotFound(w, r)
+			return
+		}
+
+		var query []byte
+		switch r.Method {
+		case http.MethodGet:
+			encoded := r.URL.Query().Get("dns")
+			if encoded == "" {
+				http.Error(w, "missing dns query parameter", http.StatusBadRequest)
+				return
+			}
+			var err error
+			query, err = decodeQuery(encoded)
+			if err != nil {
+				http.Error(w, "invalid dns query encoding", http.StatusBadRequest)
+				return
+			}
+		case http.MethodPost:
+			if maxBody <= 0 || maxBody > maxDNSPacket {
+				maxBody = maxDNSPacket
+			}
+			if r.ContentLength > int64(maxBody) {
+				http.Error(w, "DNS message too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, int64(maxBody))
+			var err error
+			query, err = io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, "failed to read dns message", http.StatusBadRequest)
+				return
+			}
+			if len(query) == 0 {
+				http.Error(w, "empty DNS message", http.StatusBadRequest)
+				return
+			}
+		default:
+			w.Header().Set("Allow", "GET, POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		response, err := dnsExchange(upstream, query)
+		if err != nil {
+			log.Printf("DNS exchange failed: %v", err)
+			http.Error(w, "upstream DNS failure", http.StatusBadGateway)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/dns-message")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(response)
+	}
+}
+
+func main() {
+	port := env("PORT", "8080")
+	upstream := env("DOH_UPSTREAM_ADDR", env("DNS_LISTEN", "127.0.0.1:5300"))
+	path := env("DOH_PATH", "/dns-query")
+	maxBody, _ := strconv.Atoi(env("DOH_MAX_BODY", "65535"))
+	if maxBody <= 0 || maxBody > maxDNSPacket {
+		maxBody = maxDNSPacket
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	addr := ":" + port
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           dohHandler(upstream, path, maxBody),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       30 * time.Second,
+	}
+
+	log.Printf("DoH gateway listening on %s%s -> %s", addr, path, upstream)
+	log.Printf("health endpoint: http://0.0.0.0:%s/healthz", port)
+
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(fmt.Errorf("DoH gateway: %w", err))
+	}
+}
