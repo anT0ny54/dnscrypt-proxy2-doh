@@ -1,44 +1,28 @@
-name: SnapDeploy check
+name: SnapDeploy keepalive
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    # SnapDeploy Free sleeps after 15 minutes without incoming traffic.
+    # GitHub Actions schedules can drift, so this runs every 10 minutes.
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
-
     steps:
-      - name: Check SnapDeploy
+      - name: Wake/keep container active
         env:
-          URL: ${{ secrets.KEEPALIVE_URL }}
+          KEEPALIVE_URL: ${{ secrets.KEEPALIVE_URL }}
         run: |
-          set -euo pipefail
-
-          test -n "$URL"
-
-          HTTP_CODE=$(curl \
-            --location \
-            --silent \
-            --show-error \
-            --output /dev/null \
-            --write-out "%{http_code}" \
-            --connect-timeout 10 \
+          set -eu
+          test -n "$KEEPALIVE_URL"
+          code=$(curl -L --silent --show-error --output /dev/null --write-out '%{http_code}' \
             --max-time 30 \
             -A "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/137.0 Mobile Safari/537.36" \
             -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
             "$URL")
-
-          echo "HTTP $HTTP_CODE"
-
-          case "$HTTP_CODE" in
-            2??|3??)
-              echo "Request succeeded."
-              ;;
-            *)
-              echo "Request failed."
-              exit 1
-              ;;
-          esac
+          echo "HTTP $code from $KEEPALIVE_URL"
+          test "$code" -ge 200
+          test "$code" -lt 500
+          
