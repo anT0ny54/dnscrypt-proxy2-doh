@@ -20,25 +20,19 @@ dnscrypt-proxy :127.0.0.1:5300
 HaGeZiDNS1 / HaGeZiDNS2 / HaGeZiDNS3
 ```
 
-SnapDeploy is expected to provide the public HTTPS/TLS termination. The DoH gateway only listens inside the container's service port and forwards DNS messages to the local dnscrypt-proxy listener.
+SnapDeploy is expected to provide the public HTTPS/TLS termination. The DoH gateway only listens inside the container's service port and forwards DNS messages to the local dnscrypt-proxy listener. Both processes run as an unprivileged user inside the container (see [Security and behavior notes](#security-and-behavior-notes)).
 
-The image is tuned for a small service budget of **512 MB RAM and 0.25 vCPU** by limiting concurrent clients, reducing resolver certificate-refresh concurrency, using a smaller DNS cache, and disabling unused relay metadata refreshes.
+The image is tuned for a small service budget of **512 MB RAM and 0.25 vCPU** by limiting concurrent clients, reducing resolver certificate-refresh concurrency, using a smaller DNS cache, capping the Go runtime's memory target, and disabling unused relay metadata refreshes.
 
 ## Upstream and version
 
-The image pins **dnscrypt-proxy 2.1.18** for reproducible builds. The upstream project supports DNS-over-HTTPS and DNSCrypt and maintains signed public resolver sources.
+The image pins **dnscrypt-proxy 2.1.18** (the current release as of this writing) for reproducible builds. The upstream project supports DNS-over-HTTPS and DNSCrypt and maintains signed public resolver sources.
 
-The runtime defaults to:
-
-```text
-SERVER_NAMES=HaGeZiDNS1,HaGeZiDNS2,HaGeZiDNS3
-```
-
-The resolver set is **fully self-contained**: `HaGeZiDNS1`, `HaGeZiDNS2`, and `HaGeZiDNS3` are defined directly as static resolver stamps in `config/dnscrypt-proxy.toml`. No public-resolver source is enabled and no resolver names are downloaded or selected dynamically. The container uses only these three configured HaGeZi upstreams.
+The resolver set is **fixed and self-contained**: `HaGeZiDNS1`, `HaGeZiDNS2`, and `HaGeZiDNS3` are defined directly as static resolver stamps in `config/dnscrypt-proxy.toml`. No public-resolver source is enabled, and the resolver set is **not** runtime-configurable — there is no environment variable that changes it. No resolver names are downloaded or selected dynamically; the container uses only these three configured HaGeZi upstreams.
 
 ## SnapDeploy configuration
 
-Create a Docker service from this repository. Set the environment variables below:
+Create a Docker service from this repository. Set the environment variables below (see also `.env.example`):
 
 ```text
 DOH_PATH=/dns-query
@@ -47,13 +41,15 @@ DNS_LISTEN=127.0.0.1:5300
 DOH_MAX_BODY=65535
 ```
 
-**Do not override `PORT`.** SnapDeploy should provide the service port through `PORT`; the DoH gateway binds to that value.
+**Do not override `PORT`.** SnapDeploy should provide the service port through `PORT`; the DoH gateway binds to that value. It must be an unprivileged port (>1024) — both processes run as a non-root user, so binding a port below 1024 would fail. This is the normal case for SnapDeploy and similar platforms.
 
-After deployment, the public resolver URL is:
+After deployment, set `PUBLIC_DOH_URL` to the exact hostname SnapDeploy assigns your container (`*.containers.snapdeploy.app` alone is only a wildcard pattern, not a usable client endpoint):
 
 ```text
-https://<your-container-id>.containers.snapdeploy.app/dns-query
+PUBLIC_DOH_URL=https://dp-871de.containers.snapdeploy.app/dns-query
 ```
+
+This is cosmetic only — it's echoed in the startup log so you can copy the client URL from there. It doesn't affect DNS routing.
 
 Health check:
 
@@ -79,7 +75,6 @@ Run:
 
 ```bash
 docker run --rm -p 8080:8080 \
-  -e SERVER_NAMES='HaGeZiDNS1,HaGeZiDNS2,HaGeZiDNS3' \
   -e PORT=8080 \
   dnscrypt-proxy2-snapdeploy-doh
 ```
@@ -90,7 +85,7 @@ Then check:
 http://127.0.0.1:8080/healthz
 ```
 
-For a real DoH client, place the container behind HTTPS/TLS and use `/dns-query`.
+For a real DoH client, place the container behind HTTPS/TLS and use `/dns-query`. Opening `/dns-query` in a normal browser is not a valid DoH test and may return HTTP 400 because no DNS message was supplied — test with a DoH-capable client, or send an RFC 8484 DNS message using GET (`?dns=`) or POST (`Content-Type: application/dns-message`). The root URL `/` returns a simple diagnostic page instead.
 
 ## Runtime settings
 
@@ -101,7 +96,10 @@ For a real DoH client, place the container behind HTTPS/TLS and use `/dns-query`
 | `DNS_LISTEN` | `127.0.0.1:5300` | Local DNS listener used by the gateway |
 | `DOH_UPSTREAM_ADDR` | `127.0.0.1:5300` | Gateway's local DNS target |
 | `DOH_MAX_BODY` | `65535` | Maximum DoH POST body size in bytes |
-| `PORT` | `8080` in the image | Managed by SnapDeploy; don't override there |
+| `PUBLIC_DOH_URL` | (see `.env.example`) | Cosmetic: shown in the startup log only |
+| `PORT` | `8080` in the image | Managed by SnapDeploy; don't override there. Must be >1024. |
+
+The resolver set (`SERVER_NAMES` in earlier versions of this deployment) is **not** listed here because it's no longer runtime-configurable; see [Upstream and version](#upstream-and-version).
 
 ## Resource profile
 
@@ -117,17 +115,20 @@ ipv6_servers = false
 dnscrypt_servers = false
 doh_servers = true
 odoh_servers = false
+GOMAXPROCS = 1
+GOMEMLIMIT = 300MiB
 ```
 
-These settings keep the service small without disabling the core encrypted-DoH forwarding path. dnscrypt-proxy's own configuration documents `max_clients`, certificate-refresh concurrency, keepalive, cache, and DoH server selection as tunable runtime options.
+These settings keep the service small without disabling the core encrypted-DoH forwarding path. dnscrypt-proxy's own configuration documents `max_clients`, certificate-refresh concurrency, keepalive, cache, and DoH server selection as tunable runtime options. `GOMAXPROCS` and `GOMEMLIMIT` are Go runtime knobs: Go does not read the container's cgroup CPU quota on its own, so pinning `GOMAXPROCS=1` avoids the scheduler/GC sizing itself for however many CPUs the host has, and `GOMEMLIMIT` gives the garbage collector a soft target comfortably under the 512MB hard limit shared by both processes.
 
 ## Security and behavior notes
 
 - Public HTTPS is expected to be terminated by SnapDeploy.
 - The DoH gateway accepts standard DNS-over-HTTPS GET (`?dns=`) and POST (`application/dns-message`) requests.
 - DNS requests from the gateway are sent only to the local dnscrypt-proxy listener, not directly to public port 53.
-- dnscrypt-proxy uses only the three static HaGeZi resolver stamps included in the configuration; no public-resolver source is enabled.
+- dnscrypt-proxy uses only the three static HaGeZi resolver stamps included in the configuration; no public-resolver source is enabled, and the set can't be changed at runtime.
 - Bootstrap resolvers are retained only for hostname/certificate bootstrap where a static stamp requires it. They are not configured as normal upstream resolvers.
+- Both `dnscrypt-proxy` and `doh-gateway` — including the internet-facing gateway process — run as an unprivileged user inside the container, dropped via `su-exec` at startup.
 - The container exits if either dnscrypt-proxy or the DoH gateway unexpectedly dies, so the platform can restart a broken instance instead of keeping a partially working process alive.
 
 ## Files
@@ -137,6 +138,7 @@ These settings keep the service small without disabling the core encrypted-DoH f
 ├── Dockerfile
 ├── .dockerignore
 ├── .env.example
+├── .gitignore
 ├── CHANGELOG.md
 ├── README.md
 ├── start.sh
@@ -155,24 +157,4 @@ These settings keep the service small without disabling the core encrypted-DoH f
 
 ## Updating dnscrypt-proxy
 
-Change `DNSCRYPT_VERSION` in the Dockerfile, review the upstream release notes, rebuild, and test the resolver names before deploying. The pinned release is deliberate so a platform rebuild does not unexpectedly move to a different upstream version. The current upstream release page lists 2.1.18 as the latest tagged release in the checked source.
-
-
-## Important: public SnapDeploy URL
-
-Use the exact hostname assigned to the deployed container. `https://*.containers.snapdeploy.app/dns-query` is not a valid client endpoint because `*` is only a wildcard pattern.
-
-## SnapDeploy
-
-For SnapDeploy, use the hostname assigned to the deployed container. Set `PUBLIC_DOH_URL` to that URL if you want it displayed in the startup log. Example:
-
-```text
-PUBLIC_DOH_URL=https://dp-6441d.containers.snapdeploy.app/dns-query
-```
-
-Replace only `YOUR-CONTAINER-NAME` with the actual hostname shown by SnapDeploy. The gateway listens on `0.0.0.0:${PORT}` and serves `/dns-query`; SnapDeploy should terminate public HTTPS and forward the assigned service port to the container.
-
-
-
-## Testing the public DoH endpoint
-Opening `/dns-query` in a normal browser is not a valid DoH test and may return HTTP 400 because no DNS message was supplied. Test with a DoH-capable client or send an RFC 8484 DNS message using GET (`?dns=`) or POST (`Content-Type: application/dns-message`). The root URL `/` returns a simple diagnostic page.
+Change `DNSCRYPT_VERSION` in the Dockerfile, review the upstream release notes, rebuild, and test the resolver names before deploying. The pinned release is deliberate so a platform rebuild does not unexpectedly move to a different upstream version. Also check whether upstream's `go.mod` now requires a newer Go than the `golang:1.26-alpine` builder image pinned in the Dockerfile, and bump that too if so.

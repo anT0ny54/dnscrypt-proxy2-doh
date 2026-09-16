@@ -2,7 +2,7 @@
 
 ARG DNSCRYPT_VERSION=2.1.18
 
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 
 ARG DNSCRYPT_VERSION
 ARG TARGETOS
@@ -22,7 +22,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags='-s -w' -o /out/doh-gateway .
 WORKDIR /src
 
-FROM alpine:3.22
+FROM alpine:3.24
 
 RUN apk add --no-cache ca-certificates wget su-exec && \
     addgroup -S dnscrypt && \
@@ -42,7 +42,9 @@ ENV PORT=8080 \
     DNS_LISTEN=127.0.0.1:5300 \
     DOH_PATH=/dns-query \
     DOH_UPSTREAM_ADDR=127.0.0.1:5300 \
-    DOH_MAX_BODY=65535
+    DOH_MAX_BODY=65535 \
+    GOMAXPROCS=1 \
+    GOMEMLIMIT=300MiB
 
 EXPOSE 8080
 

@@ -7,31 +7,12 @@ DNSCRYPT_BIN=/usr/local/bin/dnscrypt-proxy
 DOH_BIN=/usr/local/bin/doh-gateway
 
 dns_listen="${DNS_LISTEN:-127.0.0.1:5300}"
-server_names="${SERVER_NAMES:-HaGeZiDNS1,HaGeZiDNS2,HaGeZiDNS3}"
 
-# Convert SERVER_NAMES=Name1,Name2 into TOML string-array syntax.
-# Resolver names are expected to be simple public-resolver identifiers.
-toml_names=""
-old_ifs=$IFS
-IFS=','
-for name in $server_names; do
-    name=$(printf '%s' "$name" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-    [ -n "$name" ] || continue
-    [ -z "$toml_names" ] || toml_names="$toml_names, "
-    # Escape backslash and single quote for TOML single-quoted strings.
-    name=$(printf '%s' "$name" | sed "s/\\\\/\\\\\\\\/g; s/'/''/g")
-    toml_names="$toml_names'$name'"
-done
-IFS=$old_ifs
-
-[ -n "$toml_names" ] || {
-    echo "ERROR: SERVER_NAMES must contain at least one resolver name." >&2
-    exit 1
-}
-
-# Write only the runtime-controlled values; keep the rest of the pinned config immutable.
+# The resolver set (server_names / [static.*] stamps) is intentionally NOT
+# runtime-configurable. This deployment is documented as fully self-contained,
+# using only the three pinned HaGeZi stamps baked into dnscrypt-proxy.toml, so
+# only the local wiring (listen address) is rewritten here.
 sed -i \
-    -e "s#^server_names = .*#server_names = [$toml_names]#" \
     -e "s#^listen_addresses = .*#listen_addresses = ['$dns_listen']#" \
     "$CONFIG_FILE"
 
@@ -53,9 +34,13 @@ doh_bind="${DOH_BIND:-0.0.0.0}"
 # the hostname assigned by SnapDeploy. It does not control DNS routing.
 PUBLIC_DOH_URL="${PUBLIC_DOH_URL:-https://dp-871de.containers.snapdeploy.app/dns-query}"
 
+# Read back the pinned resolver names for an accurate startup log line,
+# instead of duplicating them as a literal string that could drift from the config.
+resolver_names=$(sed -n "s/^server_names = \[\(.*\)\]\$/\1/p" "$CONFIG_FILE" | tr -d "'" | head -n1)
+
 echo "Starting dnscrypt-proxy 2 + DoH gateway"
 echo "  dnscrypt-proxy : $dns_listen"
-echo "  server_names   : $server_names (static-only)"
+echo "  resolvers      : ${resolver_names:-see config} (pinned, static-only)"
 echo "  DoH endpoint   : ${doh_bind}:$port$doh_path"
 echo "  Public DoH URL : $PUBLIC_DOH_URL"
 echo "  memory target  : 512 MB"
@@ -103,7 +88,11 @@ if [ "$ready" -ne 1 ]; then
     exit 1
 fi
 
-"$DOH_BIN" &
+# The DoH gateway is the internet-facing component (SnapDeploy forwards public
+# HTTPS to it directly), so it runs as the unprivileged user too, matching
+# dnscrypt-proxy. It needs no root capability: PORT is expected to be an
+# unprivileged port (>1024), as SnapDeploy and similar platforms assign.
+su-exec dnscrypt "$DOH_BIN" &
 doh_pid=$!
 
 # Exit if either component dies. This makes the container fail fast instead of
