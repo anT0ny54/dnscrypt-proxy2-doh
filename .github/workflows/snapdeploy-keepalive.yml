@@ -1,24 +1,53 @@
-name: SnapDeploy keepalive
+name: SnapDeploy health check
 
 on:
   schedule:
-    # SnapDeploy Free sleeps after 15 minutes without incoming traffic.
-    # GitHub Actions schedules can drift, so this runs every 10 minutes.
     - cron: '*/10 * * * *'
   workflow_dispatch:
 
+permissions: {}
+
 jobs:
-  ping:
+  healthcheck:
     runs-on: ubuntu-latest
+    timeout-minutes: 2
+
     steps:
-      - name: Wake/keep container active
+      - name: Check SnapDeploy application
         env:
-          KEEPALIVE_URL: ${{ secrets.KEEPALIVE_URL }}
+          APP_URL: ${{ secrets.KEEPALIVE_URL }}
+        shell: bash
         run: |
-          set -eu
-          test -n "$KEEPALIVE_URL"
-          code=$(curl -L --silent --show-error --output /dev/null --write-out '%{http_code}' \
-            --max-time 30 "$KEEPALIVE_URL")
-          echo "HTTP $code from $KEEPALIVE_URL"
-          test "$code" -ge 200
-          test "$code" -lt 500
+          set -euo pipefail
+
+          if [[ -z "${APP_URL:-}" ]]; then
+            echo "::error::KEEPALIVE_URL secret is empty or missing"
+            exit 1
+          fi
+
+          echo "Checking: $APP_URL"
+
+          response="$(
+            curl \
+              --fail-with-body \
+              --silent \
+              --show-error \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --retry 2 \
+              --retry-delay 3 \
+              --write-out $'\n%{http_code}' \
+              "$APP_URL"
+          )"
+
+          http_code="${response##*$'\n'}"
+          body="${response%$'\n'*}"
+
+          echo "HTTP status: $http_code"
+
+          if [[ "$http_code" != "2"* ]]; then
+            echo "::error::Application returned HTTP $http_code"
+            exit 1
+          fi
+
+          echo "SnapDeploy application is responding normally."
