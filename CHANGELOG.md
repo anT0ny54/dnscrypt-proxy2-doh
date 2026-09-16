@@ -1,3 +1,6 @@
+
+### fixed-v3
+- Fixed startup `sed` invocation so the DNSCrypt `server_names` setting is edited in-place with `sed -i`.
 # Changelog
 - Fixed the Docker build to checkout the upstream `2.1.18` tag without adding a non-existent `v` prefix.
 
