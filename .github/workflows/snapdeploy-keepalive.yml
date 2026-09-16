@@ -1,53 +1,44 @@
-name: SnapDeploy health check
+name: SnapDeploy check
 
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: "*/10 * * * *"
   workflow_dispatch:
 
-permissions: {}
-
 jobs:
-  healthcheck:
+  ping:
     runs-on: ubuntu-latest
     timeout-minutes: 2
 
     steps:
-      - name: Check SnapDeploy application
+      - name: Check SnapDeploy
         env:
-          APP_URL: ${{ secrets.KEEPALIVE_URL }}
-        shell: bash
+          URL: ${{ secrets.KEEPALIVE_URL }}
         run: |
           set -euo pipefail
 
-          if [[ -z "${APP_URL:-}" ]]; then
-            echo "::error::KEEPALIVE_URL secret is empty or missing"
-            exit 1
-          fi
+          test -n "$URL"
 
-          echo "Checking: $APP_URL"
+          HTTP_CODE=$(curl \
+            --location \
+            --silent \
+            --show-error \
+            --output /dev/null \
+            --write-out "%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            -A "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/137.0 Mobile Safari/537.36" \
+            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+            "$URL")
 
-          response="$(
-            curl \
-              --fail-with-body \
-              --silent \
-              --show-error \
-              --connect-timeout 10 \
-              --max-time 30 \
-              --retry 2 \
-              --retry-delay 3 \
-              --write-out $'\n%{http_code}' \
-              "$APP_URL"
-          )"
+          echo "HTTP $HTTP_CODE"
 
-          http_code="${response##*$'\n'}"
-          body="${response%$'\n'*}"
-
-          echo "HTTP status: $http_code"
-
-          if [[ "$http_code" != "2"* ]]; then
-            echo "::error::Application returned HTTP $http_code"
-            exit 1
-          fi
-
-          echo "SnapDeploy application is responding normally."
+          case "$HTTP_CODE" in
+            2??|3??)
+              echo "Request succeeded."
+              ;;
+            *)
+              echo "Request failed."
+              exit 1
+              ;;
+          esac
