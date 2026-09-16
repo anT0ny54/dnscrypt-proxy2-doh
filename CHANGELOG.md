@@ -1,4 +1,5 @@
 # Changelog
+- Fixed the Docker build to checkout the upstream `2.1.18` tag without adding a non-existent `v` prefix.
 
 All notable changes to this SnapDeploy Docker deployment are documented here.
 

@@ -10,7 +10,7 @@ ARG TARGETARCH
 WORKDIR /src
 
 RUN apk add --no-cache git ca-certificates
-RUN git clone --depth 1 --branch v${DNSCRYPT_VERSION} https://github.com/DNSCrypt/dnscrypt-proxy.git .
+RUN git clone --depth 1 --branch ${DNSCRYPT_VERSION} https://github.com/DNSCrypt/dnscrypt-proxy.git .
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags='-s -w' -o /out/dnscrypt-proxy ./dnscrypt-proxy
