@@ -1,129 +1,79 @@
 ###############################################################################
-# dnscrypt-proxy configuration — SnapDeploy DoH deployment                    #
-#                                                                             #
-# Trimmed from upstream's ~1000-line example-config.toml down to just the    #
-# settings this deployment actually uses, with brief comments. Full option   #
-# docs: https://github.com/DNSCrypt/dnscrypt-proxy/wiki                      #
-#                                                                             #
-# server_names / [static.*] below are NOT runtime-overridable (see start.sh).#
-# This deployment is deliberately self-contained: three pinned HaGeZi DoH    #
-# stamps, no remote resolver source, no dynamic resolver selection.          #
+# dnscrypt-proxy — SnapDeploy, 512 MB RAM / 0.25 vCPU
+#
+# Deliberately minimal: only settings used by this deployment are kept.
+# Upstream documentation: https://github.com/DNSCrypt/dnscrypt-proxy/wiki
+#
+# The three HaGeZi DNS-over-HTTPS stamps below contain their resolver IPs.
+# No public resolver source or plaintext bootstrap DNS is required, which keeps
+# runtime behavior self-contained and avoids a separate port-53 bootstrap path.
 ###############################################################################
 
 server_names = ['HaGeZiDNS1', 'HaGeZiDNS2', 'HaGeZiDNS3']
 
-## listen_addresses is rewritten at container start from $DNS_LISTEN (start.sh).
+# Rewritten at container startup from $DNS_LISTEN.
 listen_addresses = ['127.0.0.1:5300']
 
-## Maximum simultaneous client connections. Kept low for the 0.25 vCPU / 512MB budget.
-max_clients = 64
-
-# user_name = 'nobody'  # not used: privilege drop is handled by start.sh/su-exec
-
+# Small but sufficient backpressure for a 0.25 vCPU instance.
+max_clients = 32
 
 ###############################################################################
-#                            Server Selection                                 #
+# Upstream selection
 ###############################################################################
 
 ipv4_servers = true
-ipv6_servers = false          # no IPv6 egress assumed on the hosting platform
-dnscrypt_servers = false      # DNSCrypt protocol resolvers disabled
-doh_servers = true            # DoH resolvers only (matches the static stamps below)
+ipv6_servers = false
+dnscrypt_servers = false
+doh_servers = true
 odoh_servers = false
 
-require_dnssec = false
-require_nolog = true          # irrelevant here: only applies to remote-source selection
-require_nofilter = true       # (no remote source is configured; static servers bypass these)
-disabled_server_names = []
-
+# Static HaGeZi stamps are the source of truth, so remote-source filters are
+# unnecessary here.
 
 ###############################################################################
-#                           Connection Settings                               #
+# Transport
 ###############################################################################
 
 force_tcp = false
 http3 = false
 http3_probe = false
-
-# proxy = 'socks5://dnscrypt:dnscrypt@127.0.0.1:9050'  # route via Tor (unused)
-# http_proxy = 'http://127.0.0.1:8888'                 # HTTP/HTTPS proxy for DoH (unused)
-
-## Per-query timeout, in milliseconds.
 timeout = 5000
-
-## Keepalive for HTTP(S)/DoH connections, in seconds.
 keepalive = 10
 
-# edns_client_subnet = ['0.0.0.0/0', '2001:db8::/32']
-# blocked_query_response = 'refused'  # default is 'hinfo'
-
-
 ###############################################################################
-#                        Load Balancing & Performance                         #
+# Load balancing
 ###############################################################################
 
-## 'p2': randomly choose 1 of the 2 fastest servers. Cheaper to compute than the
-## default 'wp2' with only 3 static servers, and avoids favoring one server
-## into a hot path under limited CPU.
+# 'wp2' picks the better of two random candidates by real-time RTT *and*
+# success rate, so a degrading resolver is routed around automatically. With
+# only three static resolvers, that matters more than the raw CPU cost of the
+# comparison, which is negligible either way (a handful of arithmetic
+# operations per query, not per HTTP request).
 lb_strategy = 'p2'
 lb_estimator = true
 
-# timeout_load_reduction = 0.75   # dynamic timeout shrink near max_clients
-# enable_hot_reload = false       # extra CPU/memory to watch config files; not needed
-
-
 ###############################################################################
-#                                Logging                                      #
+# Resolver certificate refresh
 ###############################################################################
 
-# log_level = 2
-# log_file = 'dnscrypt-proxy.log'   # logs go to stdout via start.sh instead
-# log_file_latest = true
-# use_syslog = true
-
-log_files_max_size = 10
-log_files_max_age = 7
-log_files_max_backups = 1
-
-
-###############################################################################
-#                           Certificate Management                            #
-###############################################################################
-
-## Concurrency for refreshing resolver certificates. Reduced from the default (10)
-## for the constrained CPU budget.
+# Three static DoH resolvers; two concurrent refreshes are enough for this CPU.
 cert_refresh_concurrency = 2
-cert_refresh_delay = 360
-
-# cert_ignore_timestamp = false
-# dnscrypt_ephemeral_keys = false
-# pqdnscrypt = true          # post-quantum DNSCrypt; enabled by default upstream, N/A (DoH-only)
-# tls_disable_session_tickets = false
-# tls_prefer_rsa = false
-# tls_key_log_file = '/tmp/keylog.txt'   # NEVER enable outside local debugging
-
+cert_refresh_delay = 240
 
 ###############################################################################
-#                            Startup & Network                                #
+# Startup / network behavior
 ###############################################################################
 
-## One-shot resolvers used only for initial hostname/certificate bootstrap of the
-## static DoH stamps below. User queries are never sent here.
-bootstrap_resolvers = ['9.9.9.11:53', '8.8.8.8:53']
-
+# User queries never use plaintext DNS. The static HaGeZi stamps already carry
+# resolver IPs, so no bootstrap resolver is configured.
 ignore_system_dns = true
-## 0 skips the startup network probe entirely -- appropriate in a container
-## that's expected to have working egress already. This also makes
-## netprobe_address unused; it's commented out rather than left looking active.
+# Skips the startup connectivity probe entirely. dnscrypt-proxy 2.1.17 fixed
+# this setting being silently overridden by its command-line default, so the
+# pinned 2.1.18 build is required for a value of 0 to actually take effect.
 netprobe_timeout = 0
-# netprobe_address = '9.9.9.9:53'
-
-# offline_mode = false
-# query_meta = ['key1:value1']
-
 
 ###############################################################################
-#                                 Filters                                     #
+# Local filtering / safety behavior
 ###############################################################################
 
 block_ipv6 = false
@@ -131,25 +81,8 @@ block_unqualified = true
 block_undelegated = true
 reject_ttl = 10
 
-
 ###############################################################################
-#                              Forwarding                                     #
-###############################################################################
-
-# forwarding_rules = 'forwarding-rules.txt'   # not used in this deployment
-
-
-###############################################################################
-#                                Cloaking                                     #
-###############################################################################
-
-# cloaking_rules = 'cloaking-rules.txt'
-# cloak_ttl = 600
-# cloak_ptr = false
-
-
-###############################################################################
-#                                DNS Cache                                    #
+# DNS cache
 ###############################################################################
 
 cache = true
@@ -159,193 +92,11 @@ cache_max_ttl = 86400
 cache_neg_min_ttl = 60
 cache_neg_max_ttl = 600
 
-
 ###############################################################################
-#                           Captive portal handling                           #
-###############################################################################
-
-[captive_portals]
-# map_file = 'example-captive-portals.txt'
-
-
-###############################################################################
-#                            Local DoH server                                 #
+# Public resolver stamps
 ###############################################################################
 
-[local_doh]
-## MUST stay disabled here: the doh-gateway Go binary is the DoH endpoint for
-## this deployment. Enabling this would try to bind the same service port.
-# listen_addresses = ['127.0.0.1:3000']
-# path = '/dns-query'
-# cert_file = 'localhost.pem'
-# cert_key_file = 'localhost.pem'
-
-
-###############################################################################
-#                              Query logging                                  #
-###############################################################################
-
-[query_log]
-# file = 'query.log'   # unset: no query log file is written
-format = 'tsv'
-# ignored_qtypes = ['DNSKEY', 'NS']
-
-
-###############################################################################
-#                        Suspicious queries logging                           #
-###############################################################################
-
-[nx_log]
-# file = 'nx.log'      # unset: no NXDOMAIN log file is written
-format = 'tsv'
-
-
-###############################################################################
-#                    Pattern-based blocking / allow lists                     #
-###############################################################################
-## Blocklists/allowlists are opt-in via *_file below. See the wiki for pattern
-## syntax and example blocklist sources.
-
-[blocked_names]
-# blocked_names_file = 'blocked-names.txt'
-# log_file = 'blocked-names.log'
-# log_format = 'tsv'
-
-[blocked_ips]
-# blocked_ips_file = 'blocked-ips.txt'
-# log_file = 'blocked-ips.log'
-# log_format = 'tsv'
-
-[allowed_names]
-# allowed_names_file = 'allowed-names.txt'
-# log_file = 'allowed-names.log'
-# log_format = 'tsv'
-
-[allowed_ips]
-# allowed_ips_file = 'allowed-ips.txt'
-# log_file = 'allowed-ips.log'
-# log_format = 'tsv'
-
-
-###############################################################################
-#                        Time access restrictions                             #
-###############################################################################
-
-[schedules]
-# [schedules.time-to-sleep]
-#   mon = [{after='21:00', before='7:00'}]
-
-
-###############################################################################
-#                                Servers                                      #
-###############################################################################
-
-[sources]
-## Intentionally empty: remote resolver sources are disabled. This deployment
-## is self-contained and uses only the three static HaGeZi resolvers in
-## [static.*] below — nothing is downloaded or dynamically selected.
-
-
-###############################################################################
-#                        Servers with known bugs                              #
-###############################################################################
-
-## Workarounds for resolvers that mishandle large/fragmented queries.
-[broken_implementations]
-fragments_blocked = [
-  'cisco',
-  'cisco-ipv6',
-  'cisco-familyshield',
-  'cisco-familyshield-ipv6',
-  'cisco-sandbox',
-  'cleanbrowsing-adult',
-  'cleanbrowsing-adult-ipv6',
-  'cleanbrowsing-family',
-  'cleanbrowsing-family-ipv6',
-  'cleanbrowsing-security',
-  'cleanbrowsing-security-ipv6',
-]
-
-
-###############################################################################
-#                Certificate-based client authentication for DoH              #
-###############################################################################
-
-[doh_client_x509_auth]
-# creds = [
-#    { server_name='*', client_cert='client.crt', client_key='client.key' }
-# ]
-
-
-###############################################################################
-#                          Anonymized DNS                                     #
-###############################################################################
-
-[anonymized_dns]
-# routes = [
-#    { server_name='example-server-1', via=['anon-example-1', 'anon-example-2'] }
-# ]
-skip_incompatible = false
-# direct_cert_fallback = true
-
-
-###############################################################################
-#                                 DNS64                                       #
-###############################################################################
-
-[dns64]
-# prefix = ['64:ff9b::/96']
-# resolver = ['[2606:4700:4700::64]:53', '[2001:4860:4860::64]:53']
-
-
-###############################################################################
-#                           IP Encryption                                     #
-###############################################################################
-
-[ip_encryption]
-## IPCrypt encryption for client IPs in plugin logs. "none" since no query/nx
-## log file is enabled above.
-algorithm = "none"
-key = ""
-
-
-###############################################################################
-#                            Monitoring UI                                    #
-###############################################################################
-
-[monitoring_ui]
-enabled = false
-
-## NOTE: kept off 127.0.0.1:8080 deliberately — the doh-gateway binary already
-## binds 0.0.0.0:$PORT (8080 by default), and 0.0.0.0 covers the loopback
-## interface too, so the two would collide if this were ever enabled without
-## also changing the port here.
-listen_address = "127.0.0.1:8081"
-
-## Change these before ever enabling the UI.
-username = "admin"
-password = "changeme"
-
-tls_certificate = ""
-tls_key = ""
-
-enable_query_log = true
-privacy_level = 1   # 0=full detail, 1=anonymize client IPs, 2=aggregate only
-
-# max_query_log_entries = 100
-# max_memory_mb = 1
-# prometheus_enabled = false
-# prometheus_path = "/metrics"
-
-
-###############################################################################
-#                            Static entries                                   #
-###############################################################################
-## The three resolvers this deployment uses. Not runtime-configurable — see the
-## header comment and start.sh.
-
-[static]
-
+# Current HaGeZi full-protection DoH endpoints.
 [static.HaGeZiDNS1]
 stamp = 'sdns://AgMAAAAAAAAADjE4OC4zNC4xNjEuMjEwAA9yb290LmhhZ2V6aS5vcmcKL2Rucy1xdWVyeQ'
 
