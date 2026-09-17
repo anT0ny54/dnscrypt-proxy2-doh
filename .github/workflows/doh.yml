@@ -1,0 +1,31 @@
+name: Standard DoH request
+
+on:
+  schedule:
+    cron: "*/11 * * * *"
+  workflow_dispatch::
+
+jobs:
+  query:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install dnspython
+        run: python -m pip install dnspython
+
+      - name: Send DNS-over-HTTPS request
+        run: |
+          python - <<'PY'
+          import dns.message
+          import dns.query
+
+          query = dns.message.make_query("github.com", "A")
+          response = dns.query.https(
+              query,
+              "https://dns.app/dns-query",
+              post=True,
+              timeout=10,
+          )
+
+          print(response)
+          PY
