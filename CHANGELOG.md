@@ -2,6 +2,29 @@
 
 All notable changes to this SnapDeploy Docker deployment are documented here.
 
+## [1.7.0] - 2026-09-18
+
+### Fixed
+
+- `start.sh` no longer falls back to a hardcoded, unrelated public DoH URL (the maintainer's own separate free-DNS project) when `PUBLIC_DOH_URL` is left unset. The 1.4.0 entry below removed this default from the image's
+- `doh-gateway`: `DOH_MAX_BODY` now bounds GET-encoded DNS queries (`?dns=...`) the same way it already bounded POST bodies. Previously a GET query was only checked against the hard 65535-byte ceiling, so lowering `DOH_MAX_BODY` had no effect on GET requests.
+- `doh-gateway`: separated the DNS exchange budget (5s, covering one UDP attempt plus a possible TCP retry) from the HTTP server's write timeout (now 7s, previously also 5s). `net/http`'s `WriteTimeout` deadline is set once, when request headers are read, and covers the entire handler plus the response write — it is not reset afterward. At equal values, a request that legitimately used the full exchange budget could have its already-successful response cut off before it could be written back to the client. The graceful-shutdown grace period was aligned to the new write timeout for the same reason, so an in-flight request within its legitimate budget isn't killed early during a redeploy.
+
+### Added
+
+- Gateway unit tests covering the GET-path `DOH_MAX_BODY` fix and asserting the write-timeout/exchange-timeout headroom invariant.
+
+### Documentation
+
+- README: corrected `DOH_MAX_BODY`'s description to cover GET as well as POST; added a short explanation of the exchange-timeout/write-timeout headroom in the resource-tuning section; minor grammar and formatting cleanup.
+
+### Verified
+
+- dnscrypt-proxy 2.1.18 (tagged 2026-07-18) remains the latest tagged upstream release; no newer tag has shipped.
+- Go 1.27 (released 2026-08-19) and Alpine 3.24.1 remain current, compatible choices for the builder and runtime base images.
+- All three HaGeZi full-protection DoH stamps (`root`/`wurzn`/`juuri`.hagezi.org) match the current values published by the upstream `hagezi/dns-servers` repository.
+- `/opt/dnscrypt-proxy/cache` is provisioned but unused by this configuration: there is no `[sources]` block, no query/nx logging, and no cloaking or forwarding files configured, and the DNS response cache (`cache = true`) is in-memory only. Left in place rather than removed — at this resource tier an unused empty directory costs nothing, while removing it on the chance it's needed for something undocumented (e.g. a future dnscrypt-proxy feature) is a risk with no corresponding benefit.
+
 ## [1.6.0] - 2026-09-18
 
 ### Changed

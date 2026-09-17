@@ -53,16 +53,15 @@ The image ships with safe defaults; only override settings you actually need.
 | `DOH_BIND` | `0.0.0.0` | Interface for the public gateway |
 | `DOH_PATH` | `/dns-query` | Public DoH path |
 | `DOH_UPSTREAM_ADDR` | `127.0.0.1:5300` | Gateway target; normally leave unchanged |
-| `DOH_MAX_BODY` | `65535` | Maximum DoH POST body in bytes |
+| `DOH_MAX_BODY` | `65535` | Maximum DNS message size, in bytes, accepted from a GET or POST request |
 | `DOH_MAX_INFLIGHT` | `32` | Maximum concurrent DNS exchanges; hard-capped at 64 |
 | `DOH_MAX_CONNS` | `128` | Maximum open TCP connections; hard-capped at 256 |
 | `GOMAXPROCS` | `1` | Keeps both Go services appropriate for 0.25 vCPU |
 | `DNSCRYPT_GOMEMLIMIT` | `256MiB` | dnscrypt-proxy Go heap target |
 | `DOH_GOMEMLIMIT` | `32MiB` | DoH gateway Go heap target |
-| `PUBLIC_DOH_URL` | empty | Optional log-only public URL |
+| `PUBLIC_DOH_URL` | https://*.containers.snapdeploy.app/dns-query | Optional log-only public URL |
 
 `DNS_LISTEN` and `SERVER_NAMES` are intentionally not runtime settings. The bundled DNS listener and resolver set are fixed so deployment environment variables cannot accidentally break the internal topology or change the upstream policy.
-
 
 ## Resource tuning
 
@@ -79,6 +78,8 @@ The defaults are deliberately conservative for a small instance:
 The DNS cache minimum TTL is set to 60 seconds, matching dnscrypt-proxy's current default rather than artificially extending short authoritative TTLs.
 
 The gateway caps request headers at 8 KiB, uses a 15-second idle timeout, and cancels its local DNS exchange when the client request is canceled. UDP responses marked truncated are retried over TCP; a failed TCP fallback is returned as an upstream error rather than serving the truncated packet.
+
+Each DNS exchange (the UDP attempt plus a possible TCP retry) has a combined 5-second budget. The gateway's own HTTP write timeout is set higher, at 7 seconds, because Go's `net/http` write deadline starts when request headers are read and covers the whole handler, not just the final write; without that headroom, a request that legitimately used the full 5-second exchange budget could have its already-successful response cut off before it reached the client.
 
 ## DoH compatibility
 
@@ -125,7 +126,6 @@ Opening `/dns-query` directly in a browser is not a DNS query. Use a DoH-capable
 .
 ├── Dockerfile
 ├── .dockerignore
-├── .env.example
 ├── .gitignore
 ├── CHANGELOG.md
 ├── LICENSE
@@ -139,7 +139,6 @@ Opening `/dns-query` directly in a browser is not a DNS query. Use a DoH-capable
     └── main_test.go
 ```
 
-The `.github/` directory is intentionally left unchanged by this optimization pass.
 
 ## Updating
 
@@ -155,7 +154,6 @@ Update `DNSCRYPT_VERSION` only to a formally tagged dnscrypt-proxy release. Revi
 
 See [`LICENSE`](LICENSE).
 
-
 ## 🔗 Other projects by the maintainer
 
 These are unrelated to the projects above but are run by the same maintainer.
@@ -167,7 +165,7 @@ These are unrelated to the projects above but are run by the same maintainer.
 | Multi Pro + TIF (Recommended) | `https://freedns.koyeb.app/dns-query` |
 | Multi Pro + TIF (Recommended) | `https://freedns-six.vercel.app/api/doh/dns-query` |
 | Multi Pro + TIF (Backup) | `https://dnssix.netlify.app/api/doh/dns-query` |
-| Multi Pro + TIF (Recommended, but will sleep if not use in 15 minute) | `https://dns-93aca.containers.snapdeploy.app/dns-query` |
+| Multi Pro + TIF (Recommended, but sleeps after 15 minutes of inactivity) | `https://dns-93aca.containers.snapdeploy.app/dns-query` |
 
 **Bandwidth Hero Server** — a lightweight image proxy that fetches remote images, compresses them, and returns optimized versions for faster loading and lower data use: https://bhserv.netlify.app/
 
