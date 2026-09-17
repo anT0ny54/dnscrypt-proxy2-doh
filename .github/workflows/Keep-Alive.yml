@@ -2,7 +2,7 @@ name: Keep Fork Alive
 
 on:
   schedule:
-    - cron: "9 */4 * * *"
+    - cron: "17 3 1,15 * *"
   workflow_dispatch:
 
 concurrency:
@@ -52,4 +52,3 @@ jobs:
             -m "chore: update repository keep-alive [skip ci]"
 
           git push origin "HEAD:${GITHUB_REF_NAME}"
-          
