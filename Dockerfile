@@ -2,7 +2,7 @@
 
 ARG DNSCRYPT_VERSION=2.1.18
 
-# Pin the toolchain to the current Go 1.27 line for reproducible, current builds.
+# Pin the toolchain to Go 1.27 for a reproducible build toolchain.
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 
 ARG DNSCRYPT_VERSION
@@ -31,22 +31,21 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 
 FROM alpine:3.24.1
 
-RUN apk add --no-cache ca-certificates wget su-exec && \
+RUN apk add --no-cache ca-certificates && \
     addgroup -S dnscrypt && \
     adduser -S -D -H -s /sbin/nologin -G dnscrypt dnscrypt && \
-    mkdir -p /opt/dnscrypt-proxy/cache /var/log/dnscrypt-proxy && \
-    chown -R dnscrypt:dnscrypt /opt/dnscrypt-proxy /var/log/dnscrypt-proxy
+    mkdir -p /opt/dnscrypt-proxy/cache && \
+    chown -R dnscrypt:dnscrypt /opt/dnscrypt-proxy
 
 COPY --from=build /out/dnscrypt-proxy /usr/local/bin/dnscrypt-proxy
 COPY --from=build /out/doh-gateway /usr/local/bin/doh-gateway
-COPY config/dnscrypt-proxy.toml /opt/dnscrypt-proxy/dnscrypt-proxy.toml
-COPY start.sh /usr/local/bin/start.sh
+COPY --chown=dnscrypt:dnscrypt config/dnscrypt-proxy.toml /opt/dnscrypt-proxy/dnscrypt-proxy.toml
+COPY --chown=dnscrypt:dnscrypt start.sh /usr/local/bin/start.sh
 
 RUN chmod 0755 /usr/local/bin/start.sh /usr/local/bin/dnscrypt-proxy /usr/local/bin/doh-gateway
 
 ENV PORT=8080 \
     DOH_BIND=0.0.0.0 \
-    DNS_LISTEN=127.0.0.1:5300 \
     DOH_PATH=/dns-query \
     DOH_UPSTREAM_ADDR=127.0.0.1:5300 \
     DOH_MAX_BODY=65535 \
@@ -61,5 +60,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
   CMD wget -q -O - "http://127.0.0.1:${PORT}/healthz" | grep -q '^ok$' || exit 1
 
-USER root
+USER dnscrypt
 ENTRYPOINT ["/usr/local/bin/start.sh"]
