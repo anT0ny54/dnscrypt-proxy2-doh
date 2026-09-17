@@ -2,8 +2,8 @@ name: Standard DoH request
 
 on:
   schedule:
-    cron: "*/11 * * * *"
-  workflow_dispatch::
+    - cron: "*/11 * * * *"
+  workflow_dispatch:
 
 jobs:
   query:
@@ -29,3 +29,4 @@ jobs:
 
           print(response)
           PY
+          
