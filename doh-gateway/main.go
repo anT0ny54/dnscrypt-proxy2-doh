@@ -25,12 +25,9 @@ const (
 	defaultMaxBody     = maxDNSPacket
 	defaultMaxInflight = 32
 	defaultMaxConns    = 128
-	// Bounds per-connection header buffering. DoH GET/POST requests never
-	// need more than a few hundred bytes of headers; capping this well below
-	// net/http's 1 MiB default matters on a memory-constrained instance
-	// where many slow or hostile clients could otherwise hold larger buffers
-	// open simultaneously.
-	maxHeaderBytes = 8 << 10 // 8 KiB
+	maxMaxInflight     = 64
+	maxMaxConns        = 256
+	maxHeaderBytes     = 8 << 10 // 8 KiB
 )
 
 func env(key, fallback string) string {
@@ -40,37 +37,56 @@ func env(key, fallback string) string {
 	return fallback
 }
 
-func envInt(key string, fallback int) int {
+func envInt(key string, fallback, min, max int) int {
 	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {
 		return fallback
 	}
 	n, err := strconv.Atoi(v)
-	if err != nil || n <= 0 {
+	if err != nil || n < min {
 		return fallback
+	}
+	if n > max {
+		return max
 	}
 	return n
 }
 
-// limitListener caps simultaneously open TCP connections. The cap is kept
-// modest because each connection consumes kernel and Go runtime resources.
+// limitListener bounds simultaneously open TCP connections without making
+// shutdown dependent on an Accept call that is blocked waiting for capacity.
 type limitListener struct {
 	net.Listener
-	sem chan struct{}
+	sem      chan struct{}
+	done     chan struct{}
+	closeOne sync.Once
 }
 
 func newLimitListener(l net.Listener, maxConns int) net.Listener {
-	return &limitListener{Listener: l, sem: make(chan struct{}, maxConns)}
+	return &limitListener{
+		Listener: l,
+		sem:      make(chan struct{}, maxConns),
+		done:     make(chan struct{}),
+	}
 }
 
 func (l *limitListener) Accept() (net.Conn, error) {
-	l.sem <- struct{}{}
+	select {
+	case l.sem <- struct{}{}:
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+
 	c, err := l.Listener.Accept()
 	if err != nil {
 		<-l.sem
 		return nil, err
 	}
 	return &limitListenerConn{Conn: c, release: l.sem}, nil
+}
+
+func (l *limitListener) Close() error {
+	l.closeOne.Do(func() { close(l.done) })
+	return l.Listener.Close()
 }
 
 type limitListenerConn struct {
@@ -103,27 +119,23 @@ func decodeQuery(v string) ([]byte, error) {
 	return nil, lastErr
 }
 
-// watchCancel closes conn early if ctx is cancelled (the DoH client went
-// away) before the exchange finishes on its own. This frees the local socket
-// and unblocks any pending Read/Write promptly instead of holding it for the
-// full readTimeout, which matters when many short-lived goroutines are the
-// difference between headroom and pressure on a 0.25 vCPU instance.
+// watchCancel closes the local socket as soon as the HTTP request context is
+// canceled. context.AfterFunc avoids a permanently waiting goroutine per
+// exchange while still interrupting blocked network I/O promptly.
 func watchCancel(ctx context.Context, conn net.Conn) (stop func()) {
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			conn.Close()
-		case <-done:
-		}
-	}()
-	return func() { close(done) }
+	cancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	return func() { _ = cancel() }
+}
+
+func setConnDeadline(ctx context.Context, conn net.Conn) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(readTimeout)
+	}
+	_ = conn.SetDeadline(deadline)
 }
 
 func dnsExchangeUDP(ctx context.Context, addr string, q []byte) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, readTimeout)
-	defer cancel()
-
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "udp", addr)
 	if err != nil {
@@ -131,8 +143,8 @@ func dnsExchangeUDP(ctx context.Context, addr string, q []byte) ([]byte, error) 
 	}
 	defer conn.Close()
 	defer watchCancel(ctx, conn)()
+	setConnDeadline(ctx, conn)
 
-	_ = conn.SetDeadline(time.Now().Add(readTimeout))
 	if _, err := conn.Write(q); err != nil {
 		return nil, err
 	}
@@ -149,9 +161,6 @@ func dnsExchangeUDP(ctx context.Context, addr string, q []byte) ([]byte, error) 
 }
 
 func dnsExchangeTCP(ctx context.Context, addr string, q []byte) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, readTimeout)
-	defer cancel()
-
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -159,7 +168,7 @@ func dnsExchangeTCP(ctx context.Context, addr string, q []byte) ([]byte, error) 
 	}
 	defer conn.Close()
 	defer watchCancel(ctx, conn)()
-	_ = conn.SetDeadline(time.Now().Add(readTimeout))
+	setConnDeadline(ctx, conn)
 
 	frame := []byte{byte(len(q) >> 8), byte(len(q))}
 	frame = append(frame, q...)
@@ -190,18 +199,25 @@ func dnsExchange(ctx context.Context, addr string, q []byte) ([]byte, error) {
 		return nil, errors.New("invalid DNS message size")
 	}
 
+	// Keep UDP and TCP fallback inside one total budget so a failed UDP
+	// exchange cannot outlive the HTTP request's five-second write deadline.
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+
 	// UDP is the common local transport. A truncated response is retried over TCP.
 	response, udpErr := dnsExchangeUDP(ctx, addr, q)
-	if udpErr == nil && len(response) >= 4 && (response[2]&0x02) != 0 {
-		tcpResponse, err := dnsExchangeTCP(ctx, addr, q)
-		if err == nil {
+	if udpErr == nil {
+		if len(response) >= 4 && (response[2]&0x02) != 0 {
+			tcpResponse, tcpErr := dnsExchangeTCP(ctx, addr, q)
+			if tcpErr != nil {
+				return nil, fmt.Errorf("TCP fallback: %w", tcpErr)
+			}
 			return tcpResponse, nil
 		}
+		return response, nil
 	}
-	if udpErr != nil {
-		return dnsExchangeTCP(ctx, addr, q)
-	}
-	return response, nil
+
+	return dnsExchangeTCP(ctx, addr, q)
 }
 
 func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFunc {
@@ -311,8 +327,6 @@ func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFun
 
 		w.Header().Set("Content-Type", "application/dns-message")
 		w.Header().Set("Cache-Control", "no-store")
-		// Set explicitly so every response is framed with Content-Length
-		// instead of falling back to chunked transfer encoding.
 		w.Header().Set("Content-Length", strconv.Itoa(len(response)))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(response)
@@ -321,16 +335,16 @@ func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFun
 
 func main() {
 	port := env("PORT", "8080")
-	upstream := env("DOH_UPSTREAM_ADDR", env("DNS_LISTEN", "127.0.0.1:5300"))
+	upstream := env("DOH_UPSTREAM_ADDR", "127.0.0.1:5300")
 	path := env("DOH_PATH", "/dns-query")
-	maxBody := envInt("DOH_MAX_BODY", defaultMaxBody)
-	if maxBody > maxDNSPacket {
-		maxBody = maxDNSPacket
-	}
-	maxInflight := envInt("DOH_MAX_INFLIGHT", defaultMaxInflight)
-	maxConns := envInt("DOH_MAX_CONNS", defaultMaxConns)
+	maxBody := envInt("DOH_MAX_BODY", defaultMaxBody, 12, maxDNSPacket)
+	maxInflight := envInt("DOH_MAX_INFLIGHT", defaultMaxInflight, 1, maxMaxInflight)
+	maxConns := envInt("DOH_MAX_CONNS", defaultMaxConns, 1, maxMaxConns)
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
+	}
+	if path == "/" || path == "/healthz" {
+		path = "/dns-query"
 	}
 
 	bindHost := env("DOH_BIND", "0.0.0.0")
@@ -360,6 +374,7 @@ func main() {
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sig)
 
 	select {
 	case err := <-serveErr:
