@@ -30,7 +30,7 @@ doh_path="${DOH_PATH:-/dns-query}"
 doh_bind="${DOH_BIND:-0.0.0.0}"
 dnscrypt_gomemlimit="${DNSCRYPT_GOMEMLIMIT:-256MiB}"
 doh_gomemlimit="${DOH_GOMEMLIMIT:-32MiB}"
-public_doh_url="${PUBLIC_DOH_URL:-}"
+public_doh_url="${PUBLIC_DOH_URL:-https://dns-93aca.containers.snapdeploy.app/dns-query}"
 
 resolver_names=$(sed -n "s/^server_names = //p" "$CONFIG_FILE" | tr -d "'" | head -n1)
 
