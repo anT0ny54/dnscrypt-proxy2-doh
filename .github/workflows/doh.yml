@@ -22,7 +22,7 @@ jobs:
           query = dns.message.make_query("github.com", "A")
           response = dns.query.https(
               query,
-              "https://dns.app/dns-query",
+              "https://dns-93aca.containers.snapdeploy.app/dns-query",
               post=True,
               timeout=10,
           )
