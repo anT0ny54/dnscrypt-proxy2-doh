@@ -11,7 +11,7 @@
 
 server_names = ['HaGeZiDNS1', 'HaGeZiDNS2', 'HaGeZiDNS3']
 
-# Rewritten at container startup from $DNS_LISTEN.
+# Private local hop; the public gateway is the only exposed listener.
 listen_addresses = ['127.0.0.1:5300']
 
 # Small but sufficient backpressure for a 0.25 vCPU instance.
@@ -44,11 +44,6 @@ keepalive = 10
 # Load balancing
 ###############################################################################
 
-# 'wp2' picks the better of two random candidates by real-time RTT *and*
-# success rate, so a degrading resolver is routed around automatically. With
-# only three static resolvers, that matters more than the raw CPU cost of the
-# comparison, which is negligible either way (a handful of arithmetic
-# operations per query, not per HTTP request).
 lb_strategy = 'p2'
 lb_estimator = true
 
@@ -67,9 +62,8 @@ cert_refresh_delay = 240
 # User queries never use plaintext DNS. The static HaGeZi stamps already carry
 # resolver IPs, so no bootstrap resolver is configured.
 ignore_system_dns = true
-# Skips the startup connectivity probe entirely. dnscrypt-proxy 2.1.17 fixed
-# this setting being silently overridden by its command-line default, so the
-# pinned 2.1.18 build is required for a value of 0 to actually take effect.
+# Skip the extra startup connectivity probe: the static DoH stamps already
+# provide resolver addresses, and the container waits for the local listener.
 netprobe_timeout = 0
 
 ###############################################################################
@@ -87,7 +81,7 @@ reject_ttl = 10
 
 cache = true
 cache_size = 1024
-cache_min_ttl = 300
+cache_min_ttl = 60
 cache_max_ttl = 86400
 cache_neg_min_ttl = 60
 cache_neg_max_ttl = 600
