@@ -1,5 +1,43 @@
 All notable changes to this SnapDeploy Docker deployment are documented here.
 
+## [1.5.0] - 2026-09-17
+
+### Changed
+
+- `doh-gateway` now cancels its in-flight upstream DNS exchange as soon as the DoH client disconnects, instead of holding the local socket and goroutine open for the full 5-second timeout. This frees the connection/in-flight budget faster under load on a 0.25 vCPU instance.
+- `doh-gateway`'s HTTP server now caps request headers at 8 KiB (`net/http`'s default is 1 MiB), bounding per-connection memory use against slow or oversized-header clients.
+- DoH responses now carry an explicit `Content-Length` instead of relying on the standard library to infer one, avoiding chunked transfer encoding for what is always a single, small write.
+- `doh-gateway/go.mod` now declares `go 1.27`, matching the pinned `golang:1.27-alpine` builder instead of trailing it.
+- The Docker build now mounts Go's module and build caches (`--mount=type=cache`) so BuildKit-backed builds don't recompile the full dependency graph on every rebuild; this has no effect on the built image.
+
+### Fixed
+
+- Documented the two GitHub Actions keepalive workflows and the `KEEPALIVE_URL` repository secret they require. `snapdeploy-keepalive.yml` previously had no setup instructions anywhere in the project and fails outright without that secret.
+- `README.md`'s project file tree was missing `.github/workflows/`.
+
+### Verified, no change needed
+
+- dnscrypt-proxy 2.1.18, Go 1.27, and Alpine 3.24.1 are all still current as of this release; the three HaGeZi DoH stamps still resolve to their documented hostnames and IP addresses. Confirmed against upstream sources rather than assumed.
+
+## [1.4.0] - 2026-09-17
+
+### Changed
+
+- Reworked defaults specifically for **512 MB RAM / 0.25 vCPU**: `max_clients` and gateway in-flight work are now 32, gateway connection cap is 128, and split Go memory targets are 256 MiB for dnscrypt-proxy and 32 MiB for the gateway.
+- Removed the unnecessary plaintext bootstrap resolver list. The three pinned HaGeZi DoH stamps already contain resolver IPs, while `ignore_system_dns = true` prevents fallback to the host resolver.
+- Removed inactive dnscrypt-proxy sections for monitoring, captive portals, anonymized DNS, DNS64, client certificate authentication, empty remote sources, and unrelated broken-resolver workarounds.
+- Removed the stale hard-coded SnapDeploy hostname from image defaults; `PUBLIC_DOH_URL` is now optional and log-only.
+- Updated the builder to Go 1.27 and the runtime base to Alpine 3.24.1. dnscrypt-proxy remains pinned to tagged release 2.1.18.
+- Reduced gateway HTTP idle timeout from 30s to 15s to lower idle-connection overhead on the small instance.
+
+### Fixed
+
+- Gateway CORS headers are now consistent for DoH success responses, errors, and OPTIONS preflight requests.
+- Gateway defaults and documentation now agree on the same connection, concurrency, and memory limits.
+
+---
+
+
 ## [1.3.0] - 2026-09-17
 
 ### Fixed
