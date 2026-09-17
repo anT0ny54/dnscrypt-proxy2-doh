@@ -19,9 +19,18 @@ import (
 )
 
 const (
-	maxDNSPacket = 65535
-	readTimeout  = 5 * time.Second
-	writeTimeout = 5 * time.Second
+	maxDNSPacket       = 65535
+	readTimeout        = 5 * time.Second
+	writeTimeout       = 5 * time.Second
+	defaultMaxBody     = maxDNSPacket
+	defaultMaxInflight = 32
+	defaultMaxConns    = 128
+	// Bounds per-connection header buffering. DoH GET/POST requests never
+	// need more than a few hundred bytes of headers; capping this well below
+	// net/http's 1 MiB default matters on a memory-constrained instance
+	// where many slow or hostile clients could otherwise hold larger buffers
+	// open simultaneously.
+	maxHeaderBytes = 8 << 10 // 8 KiB
 )
 
 func env(key, fallback string) string {
@@ -43,10 +52,8 @@ func envInt(key string, fallback int) int {
 	return n
 }
 
-// limitListener caps the number of simultaneously open connections. On a
-// 0.25 vCPU / 512MB service this is cheap insurance against a connection
-// flood exhausting file descriptors or goroutine memory; it does not limit
-// query throughput, only how many TCP connections can be open at once.
+// limitListener caps simultaneously open TCP connections. The cap is kept
+// modest because each connection consumes kernel and Go runtime resources.
 type limitListener struct {
 	net.Listener
 	sem chan struct{}
@@ -79,30 +86,51 @@ func (c *limitListenerConn) Close() error {
 }
 
 func decodeQuery(v string) ([]byte, error) {
-	v = strings.TrimSpace(v)
-	encs := []*base64.Encoding{
+	encodings := [...]*base64.Encoding{
 		base64.RawURLEncoding,
 		base64.URLEncoding,
 		base64.RawStdEncoding,
 		base64.StdEncoding,
 	}
-	var last error
-	for _, enc := range encs {
+	var lastErr error
+	for _, enc := range encodings {
 		b, err := enc.DecodeString(v)
 		if err == nil {
 			return b, nil
 		}
-		last = err
+		lastErr = err
 	}
-	return nil, last
+	return nil, lastErr
 }
 
-func dnsExchangeUDP(addr string, q []byte) ([]byte, error) {
-	conn, err := net.DialTimeout("udp", addr, readTimeout)
+// watchCancel closes conn early if ctx is cancelled (the DoH client went
+// away) before the exchange finishes on its own. This frees the local socket
+// and unblocks any pending Read/Write promptly instead of holding it for the
+// full readTimeout, which matters when many short-lived goroutines are the
+// difference between headroom and pressure on a 0.25 vCPU instance.
+func watchCancel(ctx context.Context, conn net.Conn) (stop func()) {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-done:
+		}
+	}()
+	return func() { close(done) }
+}
+
+func dnsExchangeUDP(ctx context.Context, addr string, q []byte) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "udp", addr)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
+	defer watchCancel(ctx, conn)()
 
 	_ = conn.SetDeadline(time.Now().Add(readTimeout))
 	if _, err := conn.Write(q); err != nil {
@@ -120,17 +148,19 @@ func dnsExchangeUDP(addr string, q []byte) ([]byte, error) {
 	return buf[:n], nil
 }
 
-func dnsExchangeTCP(addr string, q []byte) ([]byte, error) {
-	conn, err := net.DialTimeout("tcp", addr, readTimeout)
+func dnsExchangeTCP(ctx context.Context, addr string, q []byte) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
+	defer watchCancel(ctx, conn)()
 	_ = conn.SetDeadline(time.Now().Add(readTimeout))
 
-	if len(q) > 0xffff {
-		return nil, errors.New("DNS message too large for TCP")
-	}
 	frame := []byte{byte(len(q) >> 8), byte(len(q))}
 	frame = append(frame, q...)
 	if _, err := conn.Write(frame); err != nil {
@@ -155,32 +185,26 @@ func dnsExchangeTCP(addr string, q []byte) ([]byte, error) {
 	return buf, nil
 }
 
-func dnsExchange(addr string, q []byte) ([]byte, error) {
+func dnsExchange(ctx context.Context, addr string, q []byte) ([]byte, error) {
 	if len(q) == 0 || len(q) > maxDNSPacket {
 		return nil, errors.New("invalid DNS message size")
 	}
 
-	// Use UDP for the common case. If the upstream response is truncated (TC=1),
-	// retry over TCP on the same local dnscrypt-proxy listener.
-	response, udpErr := dnsExchangeUDP(addr, q)
+	// UDP is the common local transport. A truncated response is retried over TCP.
+	response, udpErr := dnsExchangeUDP(ctx, addr, q)
 	if udpErr == nil && len(response) >= 4 && (response[2]&0x02) != 0 {
-		tcpResponse, err := dnsExchangeTCP(addr, q)
+		tcpResponse, err := dnsExchangeTCP(ctx, addr, q)
 		if err == nil {
 			return tcpResponse, nil
 		}
 	}
 	if udpErr != nil {
-		return dnsExchangeTCP(addr, q)
+		return dnsExchangeTCP(ctx, addr, q)
 	}
 	return response, nil
 }
 
 func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFunc {
-	// Bounds how many DNS exchanges run concurrently, independent of how many
-	// HTTP connections are open. This is the gateway's own backpressure to
-	// match dnscrypt-proxy's max_clients on the loopback side: once the limit
-	// is hit, new requests get a fast 503 instead of queuing up behind a
-	// resolver that's already at capacity.
 	inflight := make(chan struct{}, maxInflight)
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -191,8 +215,6 @@ func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFun
 			return
 		}
 
-		// Human/browser diagnostic. A browser opening /dns-query without a DNS
-		// message is not a valid DoH request, so make that case explicit.
 		if r.URL.Path == "/" {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
@@ -202,6 +224,18 @@ func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFun
 
 		if r.URL.Path != path {
 			http.NotFound(w, r)
+			return
+		}
+
+		// Public DoH endpoints are commonly used by browser-based clients, so
+		// handle CORS consistently for success, errors, and preflight requests.
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 
@@ -227,9 +261,10 @@ func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFun
 				http.Error(w, "DNS message too large", http.StatusRequestEntityTooLarge)
 				return
 			}
+
 		case http.MethodPost:
 			if maxBody <= 0 || maxBody > maxDNSPacket {
-				maxBody = maxDNSPacket
+				maxBody = defaultMaxBody
 			}
 			if r.ContentLength > int64(maxBody) {
 				http.Error(w, "DNS message too large", http.StatusRequestEntityTooLarge)
@@ -251,12 +286,7 @@ func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFun
 				http.Error(w, "empty DNS message", http.StatusBadRequest)
 				return
 			}
-		case http.MethodOptions:
-			w.Header().Set("Allow", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept")
-			w.WriteHeader(http.StatusNoContent)
-			return
+
 		default:
 			w.Header().Set("Allow", "GET, POST, OPTIONS")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -272,7 +302,7 @@ func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFun
 			return
 		}
 
-		response, err := dnsExchange(upstream, query)
+		response, err := dnsExchange(r.Context(), upstream, query)
 		if err != nil {
 			log.Printf("DNS exchange failed: %v", err)
 			http.Error(w, "upstream DNS failure", http.StatusBadGateway)
@@ -281,8 +311,9 @@ func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFun
 
 		w.Header().Set("Content-Type", "application/dns-message")
 		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
+		// Set explicitly so every response is framed with Content-Length
+		// instead of falling back to chunked transfer encoding.
+		w.Header().Set("Content-Length", strconv.Itoa(len(response)))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(response)
 	}
@@ -292,18 +323,16 @@ func main() {
 	port := env("PORT", "8080")
 	upstream := env("DOH_UPSTREAM_ADDR", env("DNS_LISTEN", "127.0.0.1:5300"))
 	path := env("DOH_PATH", "/dns-query")
-	maxBody, _ := strconv.Atoi(env("DOH_MAX_BODY", "65535"))
-	if maxBody <= 0 || maxBody > maxDNSPacket {
+	maxBody := envInt("DOH_MAX_BODY", defaultMaxBody)
+	if maxBody > maxDNSPacket {
 		maxBody = maxDNSPacket
 	}
-	maxInflight := envInt("DOH_MAX_INFLIGHT", 64)
-	maxConns := envInt("DOH_MAX_CONNS", 512)
+	maxInflight := envInt("DOH_MAX_INFLIGHT", defaultMaxInflight)
+	maxConns := envInt("DOH_MAX_CONNS", defaultMaxConns)
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
 
-	// SnapDeploy terminates public HTTPS and forwards HTTP to the container.
-	// Bind on all interfaces so the platform can reach the service port.
 	bindHost := env("DOH_BIND", "0.0.0.0")
 	addr := net.JoinHostPort(bindHost, port)
 	srv := &http.Server{
@@ -312,7 +341,8 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       readTimeout,
 		WriteTimeout:      writeTimeout,
-		IdleTimeout:       30 * time.Second,
+		IdleTimeout:       15 * time.Second,
+		MaxHeaderBytes:    maxHeaderBytes,
 	}
 
 	ln, err := net.Listen("tcp", addr)
@@ -325,8 +355,6 @@ func main() {
 	log.Printf("health endpoint: http://%s/healthz", net.JoinHostPort(bindHost, port))
 	log.Printf("limits: max %d in-flight exchanges, max %d connections", maxInflight, maxConns)
 
-	// Shut down cleanly on SIGTERM/SIGINT (e.g. from start.sh's cleanup trap)
-	// instead of connections being cut abruptly.
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
 

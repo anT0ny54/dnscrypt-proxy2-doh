@@ -1,3 +1,3 @@
 module doh-gateway
 
-go 1.23
+go 1.27
