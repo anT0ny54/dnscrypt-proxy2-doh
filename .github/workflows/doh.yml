@@ -1,29 +1,60 @@
-- name: Send DoH request
-  run: |
-    python - <<'PY'
-    import dns.message
-    import requests
+name: Test DoH Gateway
 
-    url = "https://dns-93aca.containers.snapdeploy.app/dns-query"
+on:
+  workflow_dispatch:
 
-    query = dns.message.make_query("github.com", "A")
+jobs:
+  test:
+    runs-on: ubuntu-latest
 
-    r = requests.post(
-        url,
-        data=query.to_wire(),
-        headers={
-            "Content-Type": "application/dns-message",
-            "Accept": "application/dns-message",
-        },
-        timeout=10,
-    )
+    steps:
+      - name: Test health endpoint
+        run: |
+          echo "=== /healthz ==="
+          curl -i -v \
+            --max-time 20 \
+            "https://dns-93aca.containers.snapdeploy.app/healthz" \
+            || true
 
-    print("HTTP:", r.status_code)
-    print("Content-Type:", r.headers.get("content-type"))
-    print("Body:", r.text[:500] if r.status_code != 200 else "")
+      - name: Test DoH GET endpoint
+        run: |
+          echo "=== /dns-query ==="
+          curl -i -v \
+            --max-time 20 \
+            "https://dns-93aca.containers.snapdeploy.app/dns-query" \
+            || true
 
-    r.raise_for_status()
+      - name: Test DoH POST
+        run: |
+          python - <<'PY'
+          import base64
+          import dns.message
+          import requests
 
-    response = dns.message.from_wire(r.content)
-    print(response)
-    PY
+          url = "https://dns-93aca.containers.snapdeploy.app/dns-query"
+
+          query = dns.message.make_query("github.com", "A")
+          wire = query.to_wire()
+
+          r = requests.post(
+              url,
+              data=wire,
+              headers={
+                  "Content-Type": "application/dns-message",
+                  "Accept": "application/dns-message",
+              },
+              timeout=20,
+          )
+
+          print("Status:", r.status_code)
+          print("Headers:")
+          for k, v in r.headers.items():
+              print(f"  {k}: {v}")
+
+          print("Body:", r.text[:1000])
+
+          if r.status_code == 200:
+              answer = dns.message.from_wire(r.content)
+              print("\nDNS response:")
+              print(answer)
+          PY
