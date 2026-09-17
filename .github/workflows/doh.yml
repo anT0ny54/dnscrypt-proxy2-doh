@@ -1,42 +1,29 @@
-name: Standard DoH request
+- name: Send DoH request
+  run: |
+    python - <<'PY'
+    import dns.message
+    import requests
 
-on:
-  schedule:
-    - cron: "*/11 * * * *"
-  workflow_dispatch:
+    url = "https://dns-93aca.containers.snapdeploy.app/dns-query"
 
-jobs:
-  query:
-    runs-on: ubuntu-latest
+    query = dns.message.make_query("github.com", "A")
 
-    steps:
-      - name: Install dependencies
-        run: python -m pip install dnspython requests
+    r = requests.post(
+        url,
+        data=query.to_wire(),
+        headers={
+            "Content-Type": "application/dns-message",
+            "Accept": "application/dns-message",
+        },
+        timeout=10,
+    )
 
-      - name: Send DNS-over-HTTPS request
-        run: |
-          python - <<'PY'
-          import dns.message
-          import requests
+    print("HTTP:", r.status_code)
+    print("Content-Type:", r.headers.get("content-type"))
+    print("Body:", r.text[:500] if r.status_code != 200 else "")
 
-          doh_url = "https://dns-93aca.containers.snapdeploy.app/dns-query"
+    r.raise_for_status()
 
-          query = dns.message.make_query("github.com", "A")
-          wire = query.to_wire()
-
-          response = requests.post(
-              doh_url,
-              data=wire,
-              headers={
-                  "Content-Type": "application/dns-message",
-                  "Accept": "application/dns-message",
-              },
-              timeout=10,
-          )
-
-          response.raise_for_status()
-
-          dns_response = dns.message.from_wire(response.content)
-
-          print(dns_response)
-          PY
+    response = dns.message.from_wire(r.content)
+    print(response)
+    PY
