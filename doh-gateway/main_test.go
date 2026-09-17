@@ -137,6 +137,34 @@ func itoa(n int) string {
 	return string(buf)
 }
 
+func TestHTTPWriteTimeoutHasHeadroomOverDNSExchangeTimeout(t *testing.T) {
+	// net/http's WriteTimeout is set once, at header-read time, and covers
+	// the whole handler plus the response write; it is not reset afterward.
+	// If it were <= dnsExchangeTimeout, a request that legitimately used the
+	// full DNS exchange budget could have its response cut off before it
+	// could be written. See dnsExchange's budget comment for the full story.
+	if httpWriteTimeout <= dnsExchangeTimeout {
+		t.Fatalf("httpWriteTimeout (%s) must be greater than dnsExchangeTimeout (%s)", httpWriteTimeout, dnsExchangeTimeout)
+	}
+}
+
+func TestDoHHandlerGetRejectsQueryOverMaxBody(t *testing.T) {
+	// DOH_MAX_BODY should bound GET-encoded queries the same way it bounds
+	// POST bodies, not just cap them at the hard maxDNSPacket ceiling.
+	const smallMaxBody = 16
+	h := dohHandler("127.0.0.1:1", "/dns-query", smallMaxBody, 1)
+
+	query := make([]byte, smallMaxBody+1)
+	encoded := base64.RawURLEncoding.EncodeToString(query)
+	req := httptest.NewRequest("GET", "/dns-query?dns="+encoded, nil)
+	rec := httptest.NewRecorder()
+	h(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("GET over maxBody status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+}
+
 func TestDoHHandlerGetAndPost(t *testing.T) {
 	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {

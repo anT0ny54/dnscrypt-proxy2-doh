@@ -19,9 +19,21 @@ import (
 )
 
 const (
-	maxDNSPacket       = 65535
-	readTimeout        = 5 * time.Second
-	writeTimeout       = 5 * time.Second
+	maxDNSPacket = 65535
+
+	// dnsExchangeTimeout bounds one full DNS exchange: the UDP attempt plus,
+	// if the response comes back truncated, the TCP retry.
+	dnsExchangeTimeout = 5 * time.Second
+
+	// httpWriteTimeout must stay comfortably above dnsExchangeTimeout.
+	// net/http's WriteTimeout deadline is set once, when request headers are
+	// read, and covers the entire handler plus the response write (it is not
+	// reset afterward). If it were equal to dnsExchangeTimeout, a request
+	// that legitimately used the full exchange budget could have its
+	// already-successful response cut off before it could be written.
+	httpWriteTimeout = 7 * time.Second
+	httpReadTimeout  = 5 * time.Second
+
 	defaultMaxBody     = maxDNSPacket
 	defaultMaxInflight = 32
 	defaultMaxConns    = 128
@@ -130,7 +142,7 @@ func watchCancel(ctx context.Context, conn net.Conn) (stop func()) {
 func setConnDeadline(ctx context.Context, conn net.Conn) {
 	deadline, ok := ctx.Deadline()
 	if !ok {
-		deadline = time.Now().Add(readTimeout)
+		deadline = time.Now().Add(dnsExchangeTimeout)
 	}
 	_ = conn.SetDeadline(deadline)
 }
@@ -200,8 +212,9 @@ func dnsExchange(ctx context.Context, addr string, q []byte) ([]byte, error) {
 	}
 
 	// Keep UDP and TCP fallback inside one total budget so a failed UDP
-	// exchange cannot outlive the HTTP request's five-second write deadline.
-	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	// exchange cannot run indefinitely; httpWriteTimeout leaves headroom
+	// beyond this budget for the response to actually be written.
+	ctx, cancel := context.WithTimeout(ctx, dnsExchangeTimeout)
 	defer cancel()
 
 	// UDP is the common local transport. A truncated response is retried over TCP.
@@ -273,7 +286,7 @@ func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFun
 				http.Error(w, "empty DNS message", http.StatusBadRequest)
 				return
 			}
-			if len(query) > maxDNSPacket {
+			if len(query) > maxBody {
 				http.Error(w, "DNS message too large", http.StatusRequestEntityTooLarge)
 				return
 			}
@@ -353,8 +366,8 @@ func main() {
 		Addr:              addr,
 		Handler:           dohHandler(upstream, path, maxBody, maxInflight),
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       readTimeout,
-		WriteTimeout:      writeTimeout,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      httpWriteTimeout,
 		IdleTimeout:       15 * time.Second,
 		MaxHeaderBytes:    maxHeaderBytes,
 	}
@@ -382,7 +395,7 @@ func main() {
 			log.Fatal(fmt.Errorf("DoH gateway: %w", err))
 		}
 	case <-sig:
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), httpWriteTimeout)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
 			log.Printf("DoH gateway: shutdown: %v", err)
