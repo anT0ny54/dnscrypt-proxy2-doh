@@ -1,20 +1,25 @@
 ###############################################################################
-# dnscrypt-proxy — SnapDeploy, 512 MB RAM / 0.25 vCPU
+# dnscrypt-proxy — SnapDeploy: 512 MB RAM / 0.25 vCPU
 #
-# Deliberately minimal: only settings used by this deployment are kept.
-# Upstream documentation: https://github.com/DNSCrypt/dnscrypt-proxy/wiki
+# Minimal static-resolver configuration for a public DoH gateway.
 #
-# The three HaGeZi DNS-over-HTTPS stamps below contain their resolver IPs.
-# No public resolver source or plaintext bootstrap DNS is required, which keeps
-# runtime behavior self-contained and avoids a separate port-53 bootstrap path.
+# Upstream documentation:
+#   https://github.com/DNSCrypt/dnscrypt-proxy/wiki
+# Public resolver list:
+#   https://github.com/DNSCrypt/dnscrypt-resolvers/tree/master/v3
+# HaGeZi DNS servers:
+#   https://github.com/hagezi/dns-servers
 ###############################################################################
 
+# Fixed resolver set: these stamps include the resolver IPs and DoH hostnames.
+# No runtime resolver-name override or remote source is used.
 server_names = ['HaGeZiDNS1', 'HaGeZiDNS2', 'HaGeZiDNS3']
 
-# Private local hop; the public gateway is the only exposed listener.
+# Only the local DoH gateway can reach the resolver.
 listen_addresses = ['127.0.0.1:5300']
 
-# Small but sufficient backpressure for a 0.25 vCPU instance.
+# Match the gateway's maximum concurrent DNS work for predictable backpressure
+# on a 0.25 vCPU instance.
 max_clients = 32
 
 ###############################################################################
@@ -27,18 +32,20 @@ dnscrypt_servers = false
 doh_servers = true
 odoh_servers = false
 
-# Static HaGeZi stamps are the source of truth, so remote-source filters are
-# unnecessary here.
-
 ###############################################################################
-# Transport
+# DoH transport
 ###############################################################################
 
+# DoH/HTTPS is used for all configured upstreams. HTTP/3 is disabled to avoid
+# extra UDP socket/probing work on the small CPU budget.
 force_tcp = false
 http3 = false
 http3_probe = false
 timeout = 5000
-keepalive = 10
+
+# Three long-lived upstream connections have negligible memory cost here and
+# avoid repeated TLS setup on a small CPU budget.
+keepalive = 30
 
 ###############################################################################
 # Load balancing
@@ -46,12 +53,13 @@ keepalive = 10
 
 lb_strategy = 'p2'
 lb_estimator = true
+# Preserve responsiveness as max_clients is approached.
+timeout_load_reduction = 0.75
 
 ###############################################################################
 # Resolver certificate refresh
 ###############################################################################
 
-# Three static DoH resolvers; two concurrent refreshes are enough for this CPU.
 cert_refresh_concurrency = 2
 cert_refresh_delay = 240
 
@@ -59,18 +67,20 @@ cert_refresh_delay = 240
 # Startup / network behavior
 ###############################################################################
 
-# User queries never use plaintext DNS. The static HaGeZi stamps already carry
-# resolver IPs, so no bootstrap resolver is configured.
+# No plaintext bootstrap DNS is needed: every checked-in DoH stamp contains its
+# resolver IP. Do not fall back to the container/host resolver.
 ignore_system_dns = true
-# Skip the extra startup connectivity probe: the static DoH stamps already
-# provide resolver addresses, and the container waits for the local listener.
 netprobe_timeout = 0
 
 ###############################################################################
 # Local filtering / safety behavior
 ###############################################################################
 
+# Do not synthesize AAAA filtering responses globally; IPv6 DNS queries remain
+# supported when clients request them.
 block_ipv6 = false
+
+# Reject dotless/local-looking names instead of sending them to public DNS.
 block_unqualified = true
 block_undelegated = true
 reject_ttl = 10
@@ -87,10 +97,11 @@ cache_neg_min_ttl = 60
 cache_neg_max_ttl = 600
 
 ###############################################################################
-# Public resolver stamps
+# Static HaGeZi full-protection DoH resolvers
 ###############################################################################
 
-# Current HaGeZi full-protection DoH endpoints.
+# Current HaGeZi stamps for root.hagezi.org, wurzn.hagezi.org and
+# juuri.hagezi.org — see the upstream table linked above for the authoritative list.
 [static.HaGeZiDNS1]
 stamp = 'sdns://AgMAAAAAAAAADjE4OC4zNC4xNjEuMjEwAA9yb290LmhhZ2V6aS5vcmcKL2Rucy1xdWVyeQ'
 
