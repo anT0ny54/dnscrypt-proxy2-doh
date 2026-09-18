@@ -27,19 +27,18 @@ const (
 
 	// httpWriteTimeout must stay comfortably above dnsExchangeTimeout.
 	// net/http's WriteTimeout deadline is set once, when request headers are
-	// read, and covers the entire handler plus the response write (it is not
-	// reset afterward). If it were equal to dnsExchangeTimeout, a request
-	// that legitimately used the full exchange budget could have its
-	// already-successful response cut off before it could be written.
+	// read, and covers the entire handler plus the response write.
 	httpWriteTimeout = 7 * time.Second
 	httpReadTimeout  = 5 * time.Second
 
-	defaultMaxBody     = maxDNSPacket
+	defaultMaxBody     = 8 << 10 // 8 KiB request query limit
 	defaultMaxInflight = 32
 	defaultMaxConns    = 128
 	maxMaxInflight     = 64
 	maxMaxConns        = 256
 	maxHeaderBytes     = 8 << 10 // 8 KiB
+
+	readyProbeTimeout = 500 * time.Millisecond
 )
 
 func env(key, fallback string) string {
@@ -74,6 +73,9 @@ type limitListener struct {
 }
 
 func newLimitListener(l net.Listener, maxConns int) net.Listener {
+	if maxConns < 1 {
+		maxConns = 1
+	}
 	return &limitListener{
 		Listener: l,
 		sem:      make(chan struct{}, maxConns),
@@ -129,6 +131,18 @@ func decodeQuery(v string) ([]byte, error) {
 		lastErr = err
 	}
 	return nil, lastErr
+}
+
+func validateDNSQuery(query []byte) error {
+	if len(query) < 12 {
+		return errors.New("short DNS query")
+	}
+	// QR=1 means the message is a response. A public DoH gateway should only
+	// forward query messages to its recursive resolver.
+	if query[2]&0x80 != 0 {
+		return errors.New("DNS response supplied as query")
+	}
+	return nil
 }
 
 // watchCancel closes the local socket as soon as the HTTP request context is
@@ -210,10 +224,12 @@ func dnsExchange(ctx context.Context, addr string, q []byte) ([]byte, error) {
 	if len(q) == 0 || len(q) > maxDNSPacket {
 		return nil, errors.New("invalid DNS message size")
 	}
+	if err := validateDNSQuery(q); err != nil {
+		return nil, err
+	}
 
 	// Keep UDP and TCP fallback inside one total budget so a failed UDP
-	// exchange cannot run indefinitely; httpWriteTimeout leaves headroom
-	// beyond this budget for the response to actually be written.
+	// exchange cannot create a second full timeout window.
 	ctx, cancel := context.WithTimeout(ctx, dnsExchangeTimeout)
 	defer cancel()
 
@@ -233,21 +249,52 @@ func dnsExchange(ctx context.Context, addr string, q []byte) ([]byte, error) {
 	return dnsExchangeTCP(ctx, addr, q)
 }
 
+func upstreamReady(addr string) bool {
+	conn, err := net.DialTimeout("tcp", addr, readyProbeTimeout)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func writeText(w http.ResponseWriter, status int, body string) {
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, body)
+}
+
 func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFunc {
+	if maxBody < 12 || maxBody > maxDNSPacket {
+		maxBody = defaultMaxBody
+	}
+	if maxInflight < 1 || maxInflight > maxMaxInflight {
+		maxInflight = defaultMaxInflight
+	}
 	inflight := make(chan struct{}, maxInflight)
 
 	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+
 		if r.URL.Path == "/healthz" {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, "ok\n")
+			writeText(w, http.StatusOK, "ok\n")
+			return
+		}
+
+		if r.URL.Path == "/readyz" {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			if upstreamReady(upstream) {
+				writeText(w, http.StatusOK, "ready\n")
+				return
+			}
+			writeText(w, http.StatusServiceUnavailable, "upstream unavailable\n")
 			return
 		}
 
 		if r.URL.Path == "/" {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, "dnscrypt-proxy DoH gateway\nPOST or GET /dns-query with a DNS message\n")
+			writeText(w, http.StatusOK, "dnscrypt-proxy DoH gateway\nPOST or GET /dns-query with a DNS message\n")
 			return
 		}
 
@@ -261,7 +308,7 @@ func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFun
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Access-Control-Max-Age", "86400")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -273,30 +320,27 @@ func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFun
 		case http.MethodGet:
 			encoded := r.URL.Query().Get("dns")
 			if encoded == "" {
-				http.Error(w, "missing dns query parameter", http.StatusBadRequest)
+				writeText(w, http.StatusBadRequest, "missing dns query parameter\n")
 				return
 			}
 			var err error
 			query, err = decodeQuery(encoded)
 			if err != nil {
-				http.Error(w, "invalid dns query encoding", http.StatusBadRequest)
-				return
-			}
-			if len(query) == 0 {
-				http.Error(w, "empty DNS message", http.StatusBadRequest)
+				writeText(w, http.StatusBadRequest, "invalid dns query encoding\n")
 				return
 			}
 			if len(query) > maxBody {
-				http.Error(w, "DNS message too large", http.StatusRequestEntityTooLarge)
+				writeText(w, http.StatusRequestEntityTooLarge, "DNS message too large\n")
+				return
+			}
+			if err := validateDNSQuery(query); err != nil {
+				writeText(w, http.StatusBadRequest, "invalid DNS query\n")
 				return
 			}
 
 		case http.MethodPost:
-			if maxBody <= 0 || maxBody > maxDNSPacket {
-				maxBody = defaultMaxBody
-			}
 			if r.ContentLength > int64(maxBody) {
-				http.Error(w, "DNS message too large", http.StatusRequestEntityTooLarge)
+				writeText(w, http.StatusRequestEntityTooLarge, "DNS message too large\n")
 				return
 			}
 			r.Body = http.MaxBytesReader(w, r.Body, int64(maxBody))
@@ -305,20 +349,20 @@ func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFun
 			if err != nil {
 				var tooLarge *http.MaxBytesError
 				if errors.As(err, &tooLarge) {
-					http.Error(w, "DNS message too large", http.StatusRequestEntityTooLarge)
+					writeText(w, http.StatusRequestEntityTooLarge, "DNS message too large\n")
 					return
 				}
-				http.Error(w, "failed to read dns message", http.StatusBadRequest)
+				writeText(w, http.StatusBadRequest, "failed to read DNS message\n")
 				return
 			}
-			if len(query) == 0 {
-				http.Error(w, "empty DNS message", http.StatusBadRequest)
+			if err := validateDNSQuery(query); err != nil {
+				writeText(w, http.StatusBadRequest, "invalid DNS query\n")
 				return
 			}
 
 		default:
 			w.Header().Set("Allow", "GET, POST, OPTIONS")
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeText(w, http.StatusMethodNotAllowed, "method not allowed\n")
 			return
 		}
 
@@ -327,19 +371,18 @@ func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFun
 			defer func() { <-inflight }()
 		default:
 			w.Header().Set("Retry-After", "1")
-			http.Error(w, "gateway at capacity, retry shortly", http.StatusServiceUnavailable)
+			writeText(w, http.StatusServiceUnavailable, "gateway at capacity, retry shortly\n")
 			return
 		}
 
 		response, err := dnsExchange(r.Context(), upstream, query)
 		if err != nil {
 			log.Printf("DNS exchange failed: %v", err)
-			http.Error(w, "upstream DNS failure", http.StatusBadGateway)
+			writeText(w, http.StatusBadGateway, "upstream DNS failure\n")
 			return
 		}
 
 		w.Header().Set("Content-Type", "application/dns-message")
-		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Content-Length", strconv.Itoa(len(response)))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(response)
@@ -356,7 +399,7 @@ func main() {
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
-	if path == "/" || path == "/healthz" {
+	if path == "/" || path == "/healthz" || path == "/readyz" {
 		path = "/dns-query"
 	}
 
@@ -379,8 +422,8 @@ func main() {
 	ln = newLimitListener(ln, maxConns)
 
 	log.Printf("DoH gateway listening on http://%s%s -> %s", addr, path, upstream)
-	log.Printf("health endpoint: http://%s/healthz", net.JoinHostPort(bindHost, port))
-	log.Printf("limits: max %d in-flight exchanges, max %d connections", maxInflight, maxConns)
+	log.Printf("health endpoints: http://%s/healthz and /readyz", net.JoinHostPort(bindHost, port))
+	log.Printf("limits: max %d in-flight exchanges, max %d connections, max %d-byte query", maxInflight, maxConns, maxBody)
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()

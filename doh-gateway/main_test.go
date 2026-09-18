@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -21,6 +22,24 @@ func TestDecodeQuery(t *testing.T) {
 	}
 	if string(got) != string(want) {
 		t.Fatalf("decodeQuery() = %x, want %x", got, want)
+	}
+}
+
+func TestValidateDNSQuery(t *testing.T) {
+	valid := []byte{0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	if err := validateDNSQuery(valid); err != nil {
+		t.Fatalf("validateDNSQuery(valid) error = %v", err)
+	}
+
+	short := make([]byte, 11)
+	if err := validateDNSQuery(short); err == nil {
+		t.Fatal("validateDNSQuery(short) expected an error")
+	}
+
+	response := append([]byte(nil), valid...)
+	response[2] |= 0x80
+	if err := validateDNSQuery(response); err == nil {
+		t.Fatal("validateDNSQuery(response) expected an error")
 	}
 }
 
@@ -72,7 +91,7 @@ func TestDNSExchangeTruncatedUDPFallsBackToTCP(t *testing.T) {
 	defer udp.Close()
 
 	port := udp.LocalAddr().(*net.UDPAddr).Port
-	tcp, err := net.Listen("tcp", "127.0.0.1:"+itoa(port))
+	tcp, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +131,7 @@ func TestDNSExchangeTruncatedUDPFallsBackToTCP(t *testing.T) {
 	}()
 
 	query := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
-	got, err := dnsExchange(context.Background(), "127.0.0.1:"+itoa(port), query)
+	got, err := dnsExchange(context.Background(), "127.0.0.1:"+strconv.Itoa(port), query)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,40 +140,18 @@ func TestDNSExchangeTruncatedUDPFallsBackToTCP(t *testing.T) {
 	}
 }
 
-func itoa(n int) string {
-	const digits = "0123456789"
-	if n == 0 {
-		return "0"
-	}
-	buf := make([]byte, 0, 6)
-	for n > 0 {
-		buf = append(buf, digits[n%10])
-		n /= 10
-	}
-	for i, j := 0, len(buf)-1; i < j; i, j = i+1, j-1 {
-		buf[i], buf[j] = buf[j], buf[i]
-	}
-	return string(buf)
-}
-
 func TestHTTPWriteTimeoutHasHeadroomOverDNSExchangeTimeout(t *testing.T) {
-	// net/http's WriteTimeout is set once, at header-read time, and covers
-	// the whole handler plus the response write; it is not reset afterward.
-	// If it were <= dnsExchangeTimeout, a request that legitimately used the
-	// full DNS exchange budget could have its response cut off before it
-	// could be written. See dnsExchange's budget comment for the full story.
 	if httpWriteTimeout <= dnsExchangeTimeout {
 		t.Fatalf("httpWriteTimeout (%s) must be greater than dnsExchangeTimeout (%s)", httpWriteTimeout, dnsExchangeTimeout)
 	}
 }
 
 func TestDoHHandlerGetRejectsQueryOverMaxBody(t *testing.T) {
-	// DOH_MAX_BODY should bound GET-encoded queries the same way it bounds
-	// POST bodies, not just cap them at the hard maxDNSPacket ceiling.
 	const smallMaxBody = 16
 	h := dohHandler("127.0.0.1:1", "/dns-query", smallMaxBody, 1)
 
 	query := make([]byte, smallMaxBody+1)
+	query[2] = 0
 	encoded := base64.RawURLEncoding.EncodeToString(query)
 	req := httptest.NewRequest("GET", "/dns-query?dns="+encoded, nil)
 	rec := httptest.NewRecorder()
@@ -165,13 +162,26 @@ func TestDoHHandlerGetRejectsQueryOverMaxBody(t *testing.T) {
 	}
 }
 
+func TestDoHHandlerRejectsDNSResponseMessage(t *testing.T) {
+	query := []byte{0, 2, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0}
+	h := dohHandler("127.0.0.1:1", "/dns-query", maxDNSPacket, 1)
+
+	postReq := httptest.NewRequest("POST", "/dns-query", bytes.NewReader(query))
+	postRec := httptest.NewRecorder()
+	h(postRec, postReq)
+
+	if postRec.Code != http.StatusBadRequest {
+		t.Fatalf("response-as-query status = %d, want %d", postRec.Code, http.StatusBadRequest)
+	}
+}
+
 func TestDoHHandlerGetAndPost(t *testing.T) {
 	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer udp.Close()
-	addr := "127.0.0.1:" + itoa(udp.LocalAddr().(*net.UDPAddr).Port)
+	addr := "127.0.0.1:" + strconv.Itoa(udp.LocalAddr().(*net.UDPAddr).Port)
 
 	go func() {
 		for range 2 {
@@ -207,5 +217,24 @@ func TestDoHHandlerGetAndPost(t *testing.T) {
 	}
 	if got := getRec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Fatalf("GET CORS origin = %q", got)
+	}
+}
+
+func TestReadyEndpoint(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	h := dohHandler(ln.Addr().String(), "/dns-query", maxDNSPacket, 1)
+	req := httptest.NewRequest("GET", "/readyz", nil)
+	rec := httptest.NewRecorder()
+	h(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("readyz status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != "ready\n" {
+		t.Fatalf("readyz body = %q, want %q", got, "ready\n")
 	}
 }
