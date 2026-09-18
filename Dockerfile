@@ -1,9 +1,12 @@
 # syntax=docker/dockerfile:1
 
 ARG DNSCRYPT_VERSION=2.1.18
+ARG GO_VERSION=1.27.1
+ARG ALPINE_VERSION=3.24.2
 
-# Pin the toolchain to Go 1.27 for a reproducible build toolchain.
-FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
+# Build on the requested target platform and cross-compile the two static Go
+# binaries. The Go patch version and dnscrypt-proxy release are pinned.
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine3.24 AS build
 
 ARG DNSCRYPT_VERSION
 ARG TARGETOS
@@ -11,31 +14,28 @@ ARG TARGETARCH
 WORKDIR /src
 
 RUN apk add --no-cache git ca-certificates
-RUN git clone --depth 1 --branch ${DNSCRYPT_VERSION} https://github.com/DNSCrypt/dnscrypt-proxy.git .
+RUN git clone --depth 1 --filter=blob:none --branch "${DNSCRYPT_VERSION}" \
+    https://github.com/DNSCrypt/dnscrypt-proxy.git .
 
-# Cache mounts persist Go's module and build caches across rebuilds (when the
-# builder backend supports it); a redeploy that only touches the gateway
-# source, for example, does not have to recompile dnscrypt-proxy's dependency
-# graph from scratch. They have no effect on the resulting image.
+# BuildKit cache mounts affect build speed only; they are not copied into the
+# runtime image. GOTOOLCHAIN=local prevents an unexpected toolchain download.
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
-    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    CGO_ENABLED=0 GOTOOLCHAIN=local GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags='-s -w' -o /out/dnscrypt-proxy ./dnscrypt-proxy
 
 COPY doh-gateway /src/doh-gateway
 WORKDIR /src/doh-gateway
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
-    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    CGO_ENABLED=0 GOTOOLCHAIN=local GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags='-s -w' -o /out/doh-gateway .
 
-FROM alpine:3.24.1
+FROM alpine:${ALPINE_VERSION}
 
 RUN apk add --no-cache ca-certificates && \
     addgroup -S dnscrypt && \
-    adduser -S -D -H -s /sbin/nologin -G dnscrypt dnscrypt && \
-    mkdir -p /opt/dnscrypt-proxy/cache && \
-    chown -R dnscrypt:dnscrypt /opt/dnscrypt-proxy
+    adduser -S -D -H -s /sbin/nologin -G dnscrypt dnscrypt
 
 COPY --from=build /out/dnscrypt-proxy /usr/local/bin/dnscrypt-proxy
 COPY --from=build /out/doh-gateway /usr/local/bin/doh-gateway
@@ -48,17 +48,18 @@ ENV PORT=8080 \
     DOH_BIND=0.0.0.0 \
     DOH_PATH=/dns-query \
     DOH_UPSTREAM_ADDR=127.0.0.1:5300 \
-    DOH_MAX_BODY=65535 \
+    DOH_MAX_BODY=8192 \
     DOH_MAX_INFLIGHT=32 \
     DOH_MAX_CONNS=128 \
     GOMAXPROCS=1 \
-    DNSCRYPT_GOMEMLIMIT=256MiB \
-    DOH_GOMEMLIMIT=32MiB
+    DNSCRYPT_GOMEMLIMIT=192MiB \
+    DOH_GOMEMLIMIT=24MiB
 
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
-  CMD wget -q -O - "http://127.0.0.1:${PORT}/healthz" | grep -q '^ok$' || exit 1
+# /readyz checks both the gateway and the local dnscrypt-proxy listener.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD wget -q -O - "http://127.0.0.1:${PORT}/readyz" | grep -q '^ready$' || exit 1
 
 USER dnscrypt
 ENTRYPOINT ["/usr/local/bin/start.sh"]

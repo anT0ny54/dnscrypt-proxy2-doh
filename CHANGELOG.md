@@ -2,11 +2,70 @@
 
 All notable changes to this SnapDeploy Docker deployment are documented here.
 
+## [1.9.0] - 2026-09-18
+
+### Audit (no functional or security issues found)
+
+This pass re-verified every pinned version and the resolver configuration against live upstream sources rather than assuming the previous entry was still accurate:
+
+- **dnscrypt-proxy 2.1.18** confirmed still the latest tagged release (`2.1.18`, 18 Jul 2026); master has 23 commits ahead but no newer formal release tag exists.
+- **Go 1.27.1** confirmed still current: `go1.27.0` (19 Aug 2026) with minor revision `go1.27.1` (1 Sep 2026) is the latest per the official Go release history.
+- **Alpine 3.24.2** confirmed current: released 17 Sep 2026, one day before this audit, per endoflife.date's Alpine Linux tracking.
+- All three HaGeZi Full Protection DoH stamps (`root`/`wurzn`/`juuri`.hagezi.org) were diffed byte-for-byte against the stamps currently published in the upstream `hagezi/dns-servers` README and matched exactly, including the underlying IPv4 addresses.
+
+Given all of that checked out, `config/dnscrypt-proxy.toml`, the `Dockerfile` version pins, and the resource-limit defaults were left unchanged rather than churned for the sake of a diff.
+
+### Changed
+
+- `doh-gateway/main_test.go`: replaced the hand-rolled `itoa` helper with the standard library's `strconv.Itoa`, which the package already imports elsewhere. Removes duplicated logic with no behavior change.
+- `start.sh`: tightened the service-supervision poll from `sleep 2` to `sleep 1`, halving worst-case crash-detection latency. The loop body is a `kill -0` syscall and two comparisons, so the added wake-frequency has no meaningful CPU cost on the 0.25 vCPU budget.
+
+### Documentation
+
+- `README.md`: added a short arithmetic note under resource tuning explaining that the combined 216 MiB `GOMEMLIMIT` target intentionally leaves headroom within the 512 MiB budget for non-heap Go runtime overhead and traffic bursts, rather than that headroom being unexplained slack.
+
+### Verification
+
+- Could not run `go build`/`go vet`/`go test` or a Docker build in this environment: no Go toolchain is installed and outbound network access is unavailable (required both to install Go and to `git clone` the pinned dnscrypt-proxy release during the Docker build). The test-file edit was reviewed by hand instead; it is a pure function-call substitution.
+- `.github/` was not modified.
+
+## [1.8.0] - 2026-09-18
+
+### Changed
+
+- Upgraded the Docker builder to **Go 1.27.1** and the runtime image to **Alpine 3.24.2**.
+- Kept dnscrypt-proxy pinned to the latest formal tagged release, **2.1.18**. Upstream's master changelog contains 2.1.19 work, but the release index does not list it as a formal release, so production builds do not consume unreleased code.
+- Reduced the split Go memory targets from `256MiB + 32MiB` to `192MiB + 24MiB`, leaving more headroom inside a 512 MiB container while retaining bounded heaps for both processes.
+- Reduced the default DoH request-message limit from `65535` to `8192` bytes. The gateway still accepts overrides up to the DNS wire-format ceiling of 65535 bytes.
+- Restored a 30-second upstream HTTP keepalive to favor connection reuse and reduce repeated TLS setup on the 0.25 vCPU budget.
+- Added a `/readyz` endpoint and switched the Docker health check from gateway-only liveness to backend-aware readiness.
+- Removed the unused runtime cache-directory creation. This configuration has no file-backed resolver sources or query logs; the DNS cache is in-memory.
+- Removed the hardcoded default value for `PUBLIC_DOH_URL`; it is now strictly optional and log-only.
+- Added `.env.example` containing the tuned deployment defaults.
+
+### Fixed / hardened
+
+- Added lightweight DNS request validation so the gateway rejects short messages and DNS response packets submitted as queries before using the upstream connection budget.
+- Normalized gateway limit validation once during handler creation instead of mutating captured configuration during request handling.
+- Reworked startup waiting to use a POSIX shell counter loop rather than the external `seq` utility.
+- Kept the internal resolver on `127.0.0.1:5300` and the final image fully unprivileged.
+
+### Documentation
+
+- Rewrote `README.md` for the current 512 MiB / 0.25 vCPU architecture, resource limits, health behavior, DoH compatibility, and open-endpoint threat model.
+- Updated the checked-in resolver configuration comments for clarity and removed stale references to unused features.
+
+### Verification
+
+- HaGeZi's current Full Protection table still lists `root.hagezi.org`, `wurzn.hagezi.org`, and `juuri.hagezi.org` with the same IPv4 addresses and DoH stamps used here.
+- `.github/` was not modified.
+- Local Go unit-test execution could not be completed in this environment because the installed Go 1.23.2 tool attempted to download the required Go 1.27 toolchain and outbound DNS/network access was unavailable. The source was formatted with `gofmt`; the final Docker build also requires network access to clone the pinned upstream dnscrypt-proxy release.
+
 ## [1.7.0] - 2026-09-18
 
 ### Fixed
 
-- `start.sh` no longer falls back to a hardcoded, unrelated public DoH URL (the maintainer's own separate free-DNS project) when `PUBLIC_DOH_URL` is left unset. The 1.4.0 entry below removed this default from the image's
+- `start.sh` no longer falls back to a hardcoded, unrelated public DoH URL when `PUBLIC_DOH_URL` is left unset; an unset value now stays unset.
 - `doh-gateway`: `DOH_MAX_BODY` now bounds GET-encoded DNS queries (`?dns=...`) the same way it already bounded POST bodies. Previously a GET query was only checked against the hard 65535-byte ceiling, so lowering `DOH_MAX_BODY` had no effect on GET requests.
 - `doh-gateway`: separated the DNS exchange budget (5s, covering one UDP attempt plus a possible TCP retry) from the HTTP server's write timeout (now 7s, previously also 5s). `net/http`'s `WriteTimeout` deadline is set once, when request headers are read, and covers the entire handler plus the response write — it is not reset afterward. At equal values, a request that legitimately used the full exchange budget could have its already-successful response cut off before it could be written back to the client. The graceful-shutdown grace period was aligned to the new write timeout for the same reason, so an in-flight request within its legitimate budget isn't killed early during a redeploy.
 

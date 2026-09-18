@@ -9,12 +9,10 @@ dns_listen=127.0.0.1:5300
 port="${PORT:-8080}"
 doh_path="${DOH_PATH:-/dns-query}"
 doh_bind="${DOH_BIND:-0.0.0.0}"
-dnscrypt_gomemlimit="${DNSCRYPT_GOMEMLIMIT:-256MiB}"
-doh_gomemlimit="${DOH_GOMEMLIMIT:-32MiB}"
-public_doh_url="${PUBLIC_DOH_URL:-https://dns-93aca.containers.snapdeploy.app/dns-query}"
+dnscrypt_gomemlimit="${DNSCRYPT_GOMEMLIMIT:-192MiB}"
+doh_gomemlimit="${DOH_GOMEMLIMIT:-24MiB}"
+public_doh_url="${PUBLIC_DOH_URL:-}"
 doh_upstream="${DOH_UPSTREAM_ADDR:-$dns_listen}"
-
-mkdir -p /opt/dnscrypt-proxy/cache
 
 # Validate the checked-in configuration before starting either service.
 echo "Checking dnscrypt-proxy configuration..."
@@ -33,8 +31,8 @@ if [ -n "$public_doh_url" ]; then
     echo "  Public DoH URL : $public_doh_url"
 fi
 
-# Run both services as the image's unprivileged user. Container stdout/stderr
-# is the single log stream; no runtime log file or root helper is required.
+# Both processes stay in the image's unprivileged user context. Logs go to
+# stdout/stderr so the hosting platform can collect them without file I/O.
 GOMEMLIMIT="$dnscrypt_gomemlimit" "$DNSCRYPT_BIN" -config "$CONFIG_FILE" &
 dns_pid=$!
 doh_pid=0
@@ -52,9 +50,10 @@ cleanup() {
 }
 trap cleanup INT TERM HUP EXIT
 
-# Wait for the backend listener before exposing the DoH gateway.
+# Wait for the backend TCP listener before exposing the public gateway.
 ready=0
-for _ in $(seq 1 30); do
+i=0
+while [ "$i" -lt 30 ]; do
     if ! kill -0 "$dns_pid" 2>/dev/null; then
         break
     fi
@@ -62,6 +61,7 @@ for _ in $(seq 1 30); do
         ready=1
         break
     fi
+    i=$((i + 1))
     sleep 1
 done
 
@@ -75,7 +75,10 @@ GOMEMLIMIT="$doh_gomemlimit" \
     "$DOH_BIN" &
 doh_pid=$!
 
-# Fail the container if either service unexpectedly exits.
+# Fail the container if either service unexpectedly exits. A 1s poll (rather
+# than 2s) halves worst-case crash-detection latency for negligible CPU cost
+# on the 0.25 vCPU budget: this loop is a syscall and two comparisons, not
+# meaningful work.
 while :; do
     if ! kill -0 "$dns_pid" 2>/dev/null; then
         wait "$dns_pid" 2>/dev/null || true
@@ -87,5 +90,5 @@ while :; do
         echo "ERROR: DoH gateway exited unexpectedly." >&2
         exit 1
     fi
-    sleep 2
+    sleep 1
 done
