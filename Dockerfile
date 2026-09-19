@@ -24,12 +24,14 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOTOOLCHAIN=local GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags='-s -w' -o /out/dnscrypt-proxy ./dnscrypt-proxy
 
+# -buildvcs=false: /src is a git checkout of dnscrypt-proxy, so without it Go
+# would stamp the gateway binary with dnscrypt-proxy's commit as its own.
 COPY doh-gateway /src/doh-gateway
 WORKDIR /src/doh-gateway
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOTOOLCHAIN=local GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags='-s -w' -o /out/doh-gateway .
+    go build -buildvcs=false -trimpath -ldflags='-s -w' -o /out/doh-gateway .
 
 FROM alpine:${ALPINE_VERSION}
 
@@ -37,12 +39,12 @@ RUN apk add --no-cache ca-certificates && \
     addgroup -S dnscrypt && \
     adduser -S -D -H -s /sbin/nologin -G dnscrypt dnscrypt
 
-COPY --from=build /out/dnscrypt-proxy /usr/local/bin/dnscrypt-proxy
-COPY --from=build /out/doh-gateway /usr/local/bin/doh-gateway
+# Modes are set at COPY time. A separate `RUN chmod` would rewrite the file
+# metadata in a new layer and store a second full copy of every binary.
+COPY --from=build --chmod=0755 /out/dnscrypt-proxy /usr/local/bin/dnscrypt-proxy
+COPY --from=build --chmod=0755 /out/doh-gateway /usr/local/bin/doh-gateway
 COPY --chown=dnscrypt:dnscrypt config/dnscrypt-proxy.toml /opt/dnscrypt-proxy/dnscrypt-proxy.toml
-COPY --chown=dnscrypt:dnscrypt start.sh /usr/local/bin/start.sh
-
-RUN chmod 0755 /usr/local/bin/start.sh /usr/local/bin/dnscrypt-proxy /usr/local/bin/doh-gateway
+COPY --chown=dnscrypt:dnscrypt --chmod=0755 start.sh /usr/local/bin/start.sh
 
 ENV PORT=8080 \
     DOH_BIND=0.0.0.0 \

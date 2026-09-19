@@ -33,22 +33,56 @@ fi
 
 # Both processes stay in the image's unprivileged user context. Logs go to
 # stdout/stderr so the hosting platform can collect them without file I/O.
+dns_pid=0
+doh_pid=0
+cleanup_done=0
+
+# stop_child PID TENTHS
+# Send SIGTERM, wait up to TENTHS x 0.1s for a clean exit, then SIGKILL and
+# reap. A no-op when PID is 0 (never started) or already gone. The short poll
+# interval matters: an exited-but-unreaped child still answers `kill -0`, so
+# each poll tick is also what lets the shell reap it.
+stop_child() {
+    pid=$1
+    ticks=$2
+    [ "$pid" -gt 0 ] || return 0
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        while [ "$ticks" -gt 0 ] && kill -0 "$pid" 2>/dev/null; do
+            sleep 0.1
+            ticks=$((ticks - 1))
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    fi
+    wait "$pid" 2>/dev/null || true
+}
+
+# Runs exactly once, from the EXIT trap. Stop the gateway first so in-flight
+# DoH requests can finish while dnscrypt-proxy is still answering, then stop
+# dnscrypt-proxy. The gateway's own graceful-shutdown window is 7s, so it gets
+# 7.5s here; dnscrypt-proxy gets 2s. Worst case is ~9.5s, inside the common
+# 10s container stop timeout.
+cleanup() {
+    [ "$cleanup_done" -eq 0 ] || return 0
+    cleanup_done=1
+    # Ignore further signals so a repeated SIGTERM cannot cut the drain short.
+    trap '' INT TERM HUP
+    echo "Stopping services..."
+    stop_child "$doh_pid" 75
+    stop_child "$dns_pid" 20
+}
+
+# A termination signal exits the script normally (status 0), which in turn
+# fires the EXIT trap once. The signal trap must call `exit`: without it the
+# main loop below would resume after the handler returned and misreport the
+# already-stopped children as an unexpected crash.
+trap cleanup EXIT
+trap 'exit 0' INT TERM HUP
+
 GOMEMLIMIT="$dnscrypt_gomemlimit" "$DNSCRYPT_BIN" -config "$CONFIG_FILE" &
 dns_pid=$!
-doh_pid=0
-
-cleanup() {
-    echo "Stopping services..."
-    kill "$dns_pid" 2>/dev/null || true
-    if [ "$doh_pid" -gt 0 ]; then
-        kill "$doh_pid" 2>/dev/null || true
-    fi
-    wait "$dns_pid" 2>/dev/null || true
-    if [ "$doh_pid" -gt 0 ]; then
-        wait "$doh_pid" 2>/dev/null || true
-    fi
-}
-trap cleanup INT TERM HUP EXIT
 
 # The gateway has its own /readyz endpoint and the image health check uses it.
 # Starting it immediately avoids a redundant TCP probe and keeps the runtime
@@ -59,10 +93,12 @@ GOMEMLIMIT="$doh_gomemlimit" \
     "$DOH_BIN" &
 doh_pid=$!
 
-# Fail the container if either service unexpectedly exits. A 1s poll (rather
-# than 2s) halves worst-case crash-detection latency for negligible CPU cost
-# on the 0.25 vCPU budget: this loop is a syscall and two comparisons, not
-# meaningful work.
+# Fail the container if either service unexpectedly exits. The 1s poll costs
+# a syscall and two comparisons per tick, negligible on 0.25 vCPU.
+#
+# The pause is a background sleep that we `wait` on: a trapped signal
+# interrupts `wait` immediately, whereas a foreground `sleep 1` would delay
+# the signal trap by up to a full second.
 while :; do
     if ! kill -0 "$dns_pid" 2>/dev/null; then
         wait "$dns_pid" 2>/dev/null || true
@@ -74,5 +110,6 @@ while :; do
         echo "ERROR: DoH gateway exited unexpectedly." >&2
         exit 1
     fi
-    sleep 1
+    sleep 1 &
+    wait $! || true
 done

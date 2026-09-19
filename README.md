@@ -101,8 +101,8 @@ Safe defaults are built into the image. Normally only `PORT` needs to match the 
 | `PORT` | `8080` | Public HTTP port. |
 | `DOH_BIND` | `0.0.0.0` | Public gateway bind address. |
 | `DOH_PATH` | `/dns-query` | Public DoH path; `/`, `/healthz`, and `/readyz` are reserved. |
-| `DOH_UPSTREAM_ADDR` | `127.0.0.1:5300` | Internal resolver target; normally leave unchanged. |
-| `DOH_MAX_BODY` | `8192` | Request DNS-message limit, up to `65535`. |
+| `DOH_UPSTREAM_ADDR` | `127.0.0.1:5300` | Where the gateway sends queries and probes `/readyz`. It does **not** move the dnscrypt-proxy listener, which is fixed at `127.0.0.1:5300` in `config/dnscrypt-proxy.toml`. Leave unchanged unless you deliberately point the gateway at a different resolver. |
+| `DOH_MAX_BODY` | `8192` | Request DNS-message limit, up to `65535`. `GET` queries are additionally bounded by the 8 KiB header limit (base64url adds ~33%), so very large messages need `POST`. |
 | `DOH_MAX_INFLIGHT` | `32` | Hard-capped at `64`. |
 | `DOH_MAX_CONNS` | `128` | Hard-capped at `256`. |
 | `GOMAXPROCS` | `1` | Recommended value for 0.25 vCPU. |
@@ -111,8 +111,6 @@ Safe defaults are built into the image. Normally only `PORT` needs to match the 
 | `PUBLIC_DOH_URL` | unset | Optional startup log only; does not change routing. |
 
 `DNS_LISTEN` and `SERVER_NAMES` are intentionally not runtime settings. The internal listener and resolver set remain fixed so deployment variables cannot accidentally change the topology or upstream policy.
-
-A ready-to-copy example is provided in `.env.example`.
 
 ## Health endpoints
 
@@ -129,6 +127,10 @@ GET /readyz
 Readiness check for the gateway plus the local dnscrypt-proxy TCP listener. Returns `ready` only when that backend listener can accept a TCP connection.
 
 The Docker `HEALTHCHECK` uses `/readyz`.
+
+## Shutdown and supervision
+
+`start.sh` is the container entrypoint (PID 1) and supervises both processes. If either one exits unexpectedly, the container exits with status `1` and an `ERROR:` line in the log. On `SIGTERM`/`SIGINT`/`SIGHUP` it stops the gateway first (so in-flight DoH requests can finish), then dnscrypt-proxy, escalating to `SIGKILL` if a child does not exit in time (gateway 7.5 s, dnscrypt-proxy 2 s), and exits with status `0`.
 
 ## Local Docker test
 
@@ -152,9 +154,11 @@ Use a DoH-capable client for `/dns-query`; opening that URL directly in a browse
 
 ```text
 .
+├── .github/
+│   └── workflows/
+│       └── Keep-Alive.yml
 ├── Dockerfile
 ├── .dockerignore
-├── .env.example
 ├── .gitignore
 ├── CHANGELOG.md
 ├── LICENSE
@@ -168,7 +172,7 @@ Use a DoH-capable client for `/dns-query`; opening that URL directly in a browse
     └── main_test.go
 ```
 
-The `.github/` directory is intentionally excluded from this release and was not modified.
+`.github/workflows/Keep-Alive.yml` commits a timestamp to `keep-alive.txt` on the 1st and 15th of each month so the fork stays active for GitHub Actions. It only touches the repository; it does not keep the deployed instance awake. If your platform auto-deploys on every push, those commits can trigger a redeploy.
 
 ## Updating
 
