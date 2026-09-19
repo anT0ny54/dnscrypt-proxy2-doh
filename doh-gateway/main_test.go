@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -101,14 +102,13 @@ func TestDNSExchangeTruncatedUDPFallsBackToTCP(t *testing.T) {
 
 	go func() {
 		buf := make([]byte, maxDNSPacket)
-		n, addr, err := udp.ReadFromUDP(buf)
+		_, addr, err := udp.ReadFromUDP(buf)
 		if err != nil {
 			return
 		}
 		truncated := append([]byte(nil), want...)
 		truncated[2] |= 0x02
 		_, _ = udp.WriteToUDP(truncated, addr)
-		_ = n
 	}()
 
 	go func() {
@@ -137,6 +137,69 @@ func TestDNSExchangeTruncatedUDPFallsBackToTCP(t *testing.T) {
 	}
 	if string(got) != string(want) {
 		t.Fatalf("dnsExchange() = %x, want %x", got, want)
+	}
+}
+
+func TestDNSExchangeUDPResponseIsNotAliasedToPooledBuffer(t *testing.T) {
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+	addr := udp.LocalAddr().String()
+
+	// Echo server: the response is the query, so each exchange is identifiable.
+	go func() {
+		buf := make([]byte, maxDNSPacket)
+		for {
+			n, client, err := udp.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			_, _ = udp.WriteToUDP(buf[:n], client)
+		}
+	}()
+
+	q1 := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	q2 := []byte{0, 2, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+
+	first, err := dnsExchange(context.Background(), addr, q1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A second exchange reuses the pooled receive buffer; it must not
+	// overwrite the response already returned by the first.
+	if _, err := dnsExchange(context.Background(), addr, q2); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, q1) {
+		t.Fatalf("first response changed after a second exchange: got %x, want %x", first, q1)
+	}
+}
+
+func TestDNSExchangeUDPTimeoutDoesNotFallBackToTCP(t *testing.T) {
+	// A UDP socket that never answers. Once the shared budget is spent the
+	// exchange must fail with the UDP error, not with a follow-on TCP error.
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	query := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	start := time.Now()
+	_, err = dnsExchange(ctx, udp.LocalAddr().String(), query)
+	if err == nil {
+		t.Fatal("dnsExchange() expected an error from an unresponsive upstream")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("dnsExchange() took %s, want it bounded by the context deadline", elapsed)
+	}
+	if strings.Contains(err.Error(), "dial tcp") {
+		t.Fatalf("dnsExchange() error = %v, want the UDP error, not a TCP dial error", err)
 	}
 }
 
@@ -236,5 +299,26 @@ func TestReadyEndpoint(t *testing.T) {
 	}
 	if got := rec.Body.String(); got != "ready\n" {
 		t.Fatalf("readyz body = %q, want %q", got, "ready\n")
+	}
+}
+
+func TestReadyEndpointUnavailable(t *testing.T) {
+	// Reserve a free port, then release it so nothing is listening there.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	h := dohHandler(addr, "/dns-query", maxDNSPacket, 1)
+	req := httptest.NewRequest("GET", "/readyz", nil)
+	rec := httptest.NewRecorder()
+	h(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("readyz status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	if got := rec.Body.String(); got != "upstream unavailable\n" {
+		t.Fatalf("readyz body = %q, want %q", got, "upstream unavailable\n")
 	}
 }

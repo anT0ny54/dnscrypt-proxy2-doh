@@ -41,6 +41,15 @@ const (
 	readyProbeTimeout = 500 * time.Millisecond
 )
 
+// Pre-computed health endpoint bodies: avoids a string-to-[]byte conversion
+// on every health check request.
+var (
+	healthzBody           = []byte("ok\n")
+	readyzBody            = []byte("ready\n")
+	readyzUnavailableBody = []byte("upstream unavailable\n")
+	indexBody             = []byte("dnscrypt-proxy DoH gateway\nPOST or GET /dns-query with a DNS message\n")
+)
+
 func env(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v
@@ -161,6 +170,18 @@ func setConnDeadline(ctx context.Context, conn net.Conn) {
 	_ = conn.SetDeadline(deadline)
 }
 
+// udpBufPool recycles the receive buffer for UDP responses. The buffer must be
+// the full 64 KiB: a UDP read into a smaller slice silently drops the excess
+// without setting the TC bit, which would corrupt large EDNS responses. Without
+// the pool every request allocates 64 KiB, which is heavy GC churn under the
+// gateway's small (24 MiB) heap target.
+var udpBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, maxDNSPacket)
+		return &b
+	},
+}
+
 func dnsExchangeUDP(ctx context.Context, addr string, q []byte) ([]byte, error) {
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "udp", addr)
@@ -175,15 +196,18 @@ func dnsExchangeUDP(ctx context.Context, addr string, q []byte) ([]byte, error) 
 		return nil, err
 	}
 
-	buf := make([]byte, maxDNSPacket)
-	n, err := conn.Read(buf)
+	bufp := udpBufPool.Get().(*[]byte)
+	defer udpBufPool.Put(bufp)
+
+	n, err := conn.Read(*bufp)
 	if err != nil {
 		return nil, err
 	}
 	if n < 12 {
 		return nil, errors.New("short DNS response")
 	}
-	return buf[:n], nil
+	// Copy out: the pooled buffer is reused as soon as this function returns.
+	return append([]byte(nil), (*bufp)[:n]...), nil
 }
 
 func dnsExchangeTCP(ctx context.Context, addr string, q []byte) ([]byte, error) {
@@ -224,9 +248,9 @@ func dnsExchange(ctx context.Context, addr string, q []byte) ([]byte, error) {
 	if len(q) == 0 || len(q) > maxDNSPacket {
 		return nil, errors.New("invalid DNS message size")
 	}
-	if err := validateDNSQuery(q); err != nil {
-		return nil, err
-	}
+	// Note: DNS query validation (minimum length, QR bit) is performed by the
+	// HTTP handler before this function is called; re-validating here would be
+	// redundant work on the hot path.
 
 	// Keep UDP and TCP fallback inside one total budget so a failed UDP
 	// exchange cannot create a second full timeout window.
@@ -244,6 +268,14 @@ func dnsExchange(ctx context.Context, addr string, q []byte) ([]byte, error) {
 			return tcpResponse, nil
 		}
 		return response, nil
+	}
+
+	// If the UDP attempt already spent the shared budget (timeout, or the
+	// client went away), a TCP retry cannot succeed. Return the real UDP error
+	// rather than a misleading TCP dial failure.
+	var netErr net.Error
+	if ctx.Err() != nil || (errors.As(udpErr, &netErr) && netErr.Timeout()) {
+		return nil, udpErr
 	}
 
 	return dnsExchangeTCP(ctx, addr, q)
@@ -278,23 +310,27 @@ func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFun
 
 		if r.URL.Path == "/healthz" {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			writeText(w, http.StatusOK, "ok\n")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(healthzBody)
 			return
 		}
 
 		if r.URL.Path == "/readyz" {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			if upstreamReady(upstream) {
-				writeText(w, http.StatusOK, "ready\n")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(readyzBody)
 				return
 			}
-			writeText(w, http.StatusServiceUnavailable, "upstream unavailable\n")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write(readyzUnavailableBody)
 			return
 		}
 
 		if r.URL.Path == "/" {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			writeText(w, http.StatusOK, "dnscrypt-proxy DoH gateway\nPOST or GET /dns-query with a DNS message\n")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(indexBody)
 			return
 		}
 
@@ -377,6 +413,11 @@ func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFun
 
 		response, err := dnsExchange(r.Context(), upstream, query)
 		if err != nil {
+			if r.Context().Err() != nil {
+				// The client disconnected; there is nobody to answer and
+				// nothing worth logging.
+				return
+			}
 			log.Printf("DNS exchange failed: %v", err)
 			writeText(w, http.StatusBadGateway, "upstream DNS failure\n")
 			return
@@ -408,7 +449,7 @@ func main() {
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           dohHandler(upstream, path, maxBody, maxInflight),
-		ReadHeaderTimeout: 5 * time.Second,
+		ReadHeaderTimeout: httpReadTimeout,
 		ReadTimeout:       httpReadTimeout,
 		WriteTimeout:      httpWriteTimeout,
 		IdleTimeout:       15 * time.Second,
