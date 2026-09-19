@@ -36,8 +36,9 @@ odoh_servers = false
 # DoH transport
 ###############################################################################
 
-# DoH/HTTPS is used for all configured upstreams. HTTP/3 is disabled to avoid
-# extra UDP socket/probing work on the small CPU budget.
+# All configured upstreams are DoH over HTTPS. HTTP/3 is disabled to avoid
+# extra UDP socket/probing work on the small CPU budget. force_tcp only affects
+# the DNSCrypt protocol (unused here) and is left at its default.
 force_tcp = false
 http3 = false
 http3_probe = false
