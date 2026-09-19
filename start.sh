@@ -50,10 +50,26 @@ cleanup() {
 }
 trap cleanup INT TERM HUP EXIT
 
-# The gateway has its own /readyz endpoint and the image health check uses it.
-# Starting it immediately avoids a redundant TCP probe and keeps the runtime
-# image free of an external netcat dependency. /readyz returns 503 until the
-# local dnscrypt-proxy listener is reachable.
+# Wait for the backend TCP listener before exposing the public gateway.
+ready=0
+i=0
+while [ "$i" -lt 30 ]; do
+    if ! kill -0 "$dns_pid" 2>/dev/null; then
+        break
+    fi
+    if nc -z -w 1 127.0.0.1 5300 >/dev/null 2>&1; then
+        ready=1
+        break
+    fi
+    i=$((i + 1))
+    sleep 1
+done
+
+if [ "$ready" -ne 1 ]; then
+    echo "ERROR: dnscrypt-proxy is not accepting TCP on $dns_listen within 30s." >&2
+    exit 1
+fi
+
 GOMEMLIMIT="$doh_gomemlimit" \
     DOH_UPSTREAM_ADDR="$doh_upstream" \
     "$DOH_BIN" &
