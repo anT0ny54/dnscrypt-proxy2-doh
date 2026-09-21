@@ -71,7 +71,12 @@ cert_refresh_delay = 240
 # No plaintext bootstrap DNS is needed: every checked-in DoH stamp contains its
 # resolver IP. Do not fall back to the container/host resolver.
 ignore_system_dns = true
-netprobe_timeout = 0
+
+# Wait briefly for container networking before initializing upstreams. This is
+# only a connectivity probe; it does not send a plaintext DNS query. Keeping
+# the timeout finite avoids a startup race without adding a long boot delay.
+netprobe_timeout = 15
+netprobe_address = '1.1.1.1:443'
 
 ###############################################################################
 # Local filtering / safety behavior
