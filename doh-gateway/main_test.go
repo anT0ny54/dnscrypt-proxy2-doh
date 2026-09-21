@@ -209,6 +209,52 @@ func TestHTTPWriteTimeoutHasHeadroomOverDNSExchangeTimeout(t *testing.T) {
 	}
 }
 
+func TestDoHHandlerGetStandardBase64Plus(t *testing.T) {
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+
+	addr := udp.LocalAddr().String()
+	go func() {
+		for range 2 {
+			buf := make([]byte, maxDNSPacket)
+			n, client, err := udp.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			_, _ = udp.WriteToUDP(buf[:n], client)
+		}
+	}()
+
+	// 0xf8 in the message makes the standard Base64 representation contain '+'.
+	query := []byte{0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xf8}
+	encoded := base64.StdEncoding.EncodeToString(query)
+	if !strings.Contains(encoded, "+") {
+		t.Fatalf("test fixture must contain '+': %q", encoded)
+	}
+
+	h := dohHandler(addr, "/dns-query", maxDNSPacket, 1)
+	for name, value := range map[string]string{
+		"literal plus": encoded,
+		"escaped plus": strings.ReplaceAll(encoded, "+", "%2B"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/dns-query?dns="+value, nil)
+			rec := httptest.NewRecorder()
+			h(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("standard Base64 GET status = %d, want %d", rec.Code, http.StatusOK)
+			}
+			if got := rec.Body.Bytes(); !bytes.Equal(got, query) {
+				t.Fatalf("standard Base64 GET response = %x, want %x", got, query)
+			}
+		})
+	}
+}
+
 func TestDoHHandlerGetRejectsQueryOverMaxBody(t *testing.T) {
 	const smallMaxBody = 16
 	h := dohHandler("127.0.0.1:1", "/dns-query", smallMaxBody, 1)

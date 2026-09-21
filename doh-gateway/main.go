@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -140,6 +141,35 @@ func decodeQuery(v string) ([]byte, error) {
 		lastErr = err
 	}
 	return nil, lastErr
+}
+
+// rawQueryParam extracts one query parameter using URI percent-decoding, not
+// form decoding. This matters for legacy standard Base64 DoH clients: '+' is a
+// valid Base64 character, while net/url.Values treats an unescaped '+' as a
+// space. URL-escaped '+' (%2B) therefore remains a literal '+'.
+func rawQueryParam(rawQuery, wantKey string) (string, error) {
+	for _, field := range strings.Split(rawQuery, "&") {
+		if field == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		key, err := url.PathUnescape(key)
+		if err != nil {
+			continue
+		}
+		if key != wantKey {
+			continue
+		}
+		value, err = url.PathUnescape(value)
+		if err != nil {
+			return "", err
+		}
+		return value, nil
+	}
+	return "", nil
 }
 
 func validateDNSQuery(query []byte) error {
@@ -354,12 +384,15 @@ func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFun
 		var query []byte
 		switch r.Method {
 		case http.MethodGet:
-			encoded := r.URL.Query().Get("dns")
+			encoded, err := rawQueryParam(r.URL.RawQuery, "dns")
+			if err != nil {
+				writeText(w, http.StatusBadRequest, "invalid dns query parameter\n")
+				return
+			}
 			if encoded == "" {
 				writeText(w, http.StatusBadRequest, "missing dns query parameter\n")
 				return
 			}
-			var err error
 			query, err = decodeQuery(encoded)
 			if err != nil {
 				writeText(w, http.StatusBadRequest, "invalid dns query encoding\n")
