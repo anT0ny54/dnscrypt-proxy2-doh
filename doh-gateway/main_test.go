@@ -255,6 +255,32 @@ func TestDoHHandlerGetStandardBase64Plus(t *testing.T) {
 	}
 }
 
+func TestDoHServerGetOverMaxBodyReachesHandler(t *testing.T) {
+	const maxBody = 8 << 10
+
+	h := dohHandler("127.0.0.1:1", "/dns-query", maxBody, 1)
+	srv := httptest.NewUnstartedServer(h)
+	srv.Config.MaxHeaderBytes = maxHeaderBytesFor(maxBody)
+	srv.Start()
+	defer srv.Close()
+
+	query := make([]byte, maxBody+1)
+	encoded := base64.RawURLEncoding.EncodeToString(query)
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/dns-query?dns="+encoded, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("GET over maxBody through net/http status = %d, want %d", resp.StatusCode, http.StatusRequestEntityTooLarge)
+	}
+}
+
 func TestDoHHandlerGetRejectsQueryOverMaxBody(t *testing.T) {
 	const smallMaxBody = 16
 	h := dohHandler("127.0.0.1:1", "/dns-query", smallMaxBody, 1)

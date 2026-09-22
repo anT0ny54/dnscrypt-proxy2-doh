@@ -37,7 +37,11 @@ const (
 	defaultMaxConns    = 128
 	maxMaxInflight     = 64
 	maxMaxConns        = 256
-	maxHeaderBytes     = 8 << 10 // 8 KiB
+
+	// headerOverhead budgets for the request line/method/host and the fixed
+	// set of headers the handler reads (Content-Type, Accept, etc.), on top
+	// of whatever the query itself needs.
+	headerOverhead = 2 << 10 // 2 KiB
 
 	readyProbeTimeout = 500 * time.Millisecond
 )
@@ -50,6 +54,15 @@ var (
 	readyzUnavailableBody = []byte("upstream unavailable\n")
 	indexBody             = []byte("dnscrypt-proxy DoH gateway\nPOST or GET /dns-query with a DNS message\n")
 )
+
+// maxHeaderBytesFor sizes net/http's MaxHeaderBytes with headroom for a GET
+// request's base64url-encoded query string on top of maxBody. Base64 inflates
+// data by 4/3; without this headroom a GET query sized close to maxBody would
+// be rejected at the header-parsing layer (e.g. 431) instead of reaching the
+// handler's client-friendly 413 response.
+func maxHeaderBytesFor(maxBody int) int {
+	return (maxBody*4+2)/3 + headerOverhead
+}
 
 func env(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -125,13 +138,50 @@ func (c *limitListenerConn) Close() error {
 	return err
 }
 
+// decodeQuery decodes a DoH "dns" GET parameter, which in practice arrives in
+// one of four base64 flavors: URL-safe or standard alphabet, each padded or
+// unpadded. The alphabet and padding are cheap to detect up front, so rather
+// than trying all four encodings on every request, only the one or two that
+// could possibly match are attempted.
 func decodeQuery(v string) ([]byte, error) {
-	encodings := [...]*base64.Encoding{
-		base64.RawURLEncoding,
-		base64.URLEncoding,
-		base64.RawStdEncoding,
-		base64.StdEncoding,
+	urlSafe := false
+	std := false
+	for i := 0; i < len(v); i++ {
+		switch v[i] {
+		case '-', '_':
+			urlSafe = true
+		case '+', '/':
+			std = true
+		}
 	}
+
+	padded := len(v) > 0 && v[len(v)-1] == '='
+
+	var encodings []*base64.Encoding
+	switch {
+	case urlSafe:
+		// '-'/'_' only appear in the URL-safe alphabet.
+		if padded {
+			encodings = []*base64.Encoding{base64.URLEncoding}
+		} else {
+			encodings = []*base64.Encoding{base64.RawURLEncoding}
+		}
+	case std:
+		// '+'/'/' only appear in the standard alphabet.
+		if padded {
+			encodings = []*base64.Encoding{base64.StdEncoding}
+		} else {
+			encodings = []*base64.Encoding{base64.RawStdEncoding}
+		}
+	case padded:
+		// Padded but no alphabet-distinguishing character seen: the URL-safe
+		// and standard alphabets agree on every other character.
+		encodings = []*base64.Encoding{base64.URLEncoding, base64.StdEncoding}
+	default:
+		// No padding and no distinguishing character: try both raw variants.
+		encodings = []*base64.Encoding{base64.RawURLEncoding, base64.RawStdEncoding}
+	}
+
 	var lastErr error
 	for _, enc := range encodings {
 		b, err := enc.DecodeString(v)
@@ -486,7 +536,7 @@ func main() {
 		ReadTimeout:       httpReadTimeout,
 		WriteTimeout:      httpWriteTimeout,
 		IdleTimeout:       15 * time.Second,
-		MaxHeaderBytes:    maxHeaderBytes,
+		MaxHeaderBytes:    maxHeaderBytesFor(maxBody),
 	}
 
 	ln, err := net.Listen("tcp", addr)
