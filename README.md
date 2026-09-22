@@ -53,8 +53,15 @@ The default limits are intentionally bounded for the small instance:
 |---|---:|---|
 | `max_clients` | `32` | Bounds dnscrypt-proxy work. |
 | `DOH_MAX_INFLIGHT` | `32` | Keeps HTTP and DNS concurrency aligned. |
-| `DOH_MAX_CONNS` | `128` | Caps active + idle TCP connection state. |
-| `DOH_MAX_BODY` | `8192` | Limits oversized public DoH queries while retaining room for normal DNS/EDNS use. |
+| `DOH_MAX_CONNS` | `128` | Global active TCP-connection cap; excess connections are accepted then immediately closed. |
+| `DOH_RATE_RPS` | `10` | Per-source-IP DoH request token-bucket refill rate. |
+| `DOH_RATE_BURST` | `20` | Per-source-IP token-bucket burst capacity. |
+| `DOH_MAX_IP_CONNS` | `8` | Per-source-IP active TCP connection cap; excess connections are immediately closed. |
+| `DOH_MAX_IP_REQUESTS` | `8` | Per-source-IP concurrent DoH request cap. |
+| `DOH_MAX_CLIENT_STATES` | `1024` | Hard-bounded source-IP state entries across 16 shards. |
+| `DOH_MAX_UDP_PACKET` | `8192` | Resolver-leg UDP packet limit; oversized UDP responses are silently dropped. |
+| `DOH_MAX_TCP_FRAME` | `8192` | Resolver-leg DNS-over-TCP frame limit, checked before body allocation/parsing. |
+| `DOH_MAX_BODY` | `8192` | Public DoH request DNS-message limit; the effective value cannot exceed `DOH_MAX_TCP_FRAME`. |
 | `DNSCRYPT_GOMEMLIMIT` | `192MiB` | Leaves headroom for the rest of the 512 MiB container budget. |
 | `DOH_GOMEMLIMIT` | `24MiB` | Small gateway heap target; the gateway has no external Go dependencies. |
 | `GOMAXPROCS` | `1` | Avoids running two tiny Go services as if the host had many CPUs. |
@@ -62,7 +69,9 @@ The default limits are intentionally bounded for the small instance:
 | `cert_refresh_concurrency` | `2` | Keeps maintenance work low on 0.25 vCPU. |
 | upstream HTTP keepalive | `30s` | Favors connection reuse and avoids repeated TLS setup. |
 
-The gateway sizes request headers with Base64 GET headroom instead of capping them at the 8 KiB DNS-message limit, uses a **5-second** read timeout, a **7-second** write timeout, and a **15-second** idle timeout. Each DNS exchange gets one combined **5-second** budget, including a possible UDP-to-TCP retry.
+The gateway sizes request headers with Base64 GET headroom instead of capping them at the DNS-message limit, uses a **5-second** read timeout, a **7-second** write timeout, and a **15-second** idle timeout. Each DNS exchange gets one combined **5-second** budget, including a possible UDP-to-TCP retry.
+
+The public DoH guard uses a sharded token bucket and bounded per-IP state. Rate/concurrency rejection happens before base64/DNS parsing, while transport-level overflow is handled separately: oversized UDP datagrams are silently discarded and oversized TCP DNS frames are rejected immediately after the two-byte length prefix, before body allocation. The current TCP fallback opens one connection per DNS exchange, so the maximum queries per TCP connection is fixed at **1**.
 
 The 7-second HTTP write deadline deliberately exceeds the 5-second DNS budget because Go's `net/http` write deadline covers the whole request handling interval, not only the final socket write.
 
@@ -86,11 +95,16 @@ Security/resource controls include:
 - no query log, NX log, cloaking, forwarding, monitoring UI, or hot reload;
 - unprivileged runtime user;
 - bounded request size, header size, in-flight work, and connections;
+- per-source-IP token-bucket rate limiting and concurrent request/connection caps;
+- bounded source-IP state with idle-only eviction;
+- immediate TCP closes for global/per-source connection abuse;
+- silent dropping of oversized UDP response datagrams;
+- explicit TCP DNS frame and one-query-per-connection guards;
 - client-disconnect cancellation of the local DNS exchange;
 - UDP-to-TCP fallback for truncated local responses;
 - `/readyz` checks that the local dnscrypt-proxy TCP listener is reachable.
 
-This is still an **open** DoH endpoint: there is no authentication and no per-client quota. The connection and in-flight caps are instance-level resource controls, not an abuse-prevention system. For a personal or low-traffic public endpoint, the limits are intended to keep the service within the small container budget.
+This remains an **open** DoH endpoint with no authentication. The guard adds source-IP rate and concurrency controls, but it is not a substitute for an upstream WAF/CDN or an application-layer authentication policy. With a reverse proxy in front, configure `DOH_TRUSTED_PROXY_CIDRS` so the per-source-IP request limits can use the original client IP safely; header values are otherwise ignored.
 
 ## SnapDeploy environment
 
@@ -102,15 +116,23 @@ Safe defaults are built into the image. Normally only `PORT` needs to match the 
 | `DOH_BIND` | `0.0.0.0` | Public gateway bind address. |
 | `DOH_PATH` | `/dns-query` | Public DoH path; `/`, `/healthz`, and `/readyz` are reserved. |
 | `DOH_UPSTREAM_ADDR` | `127.0.0.1:5300` | Where the gateway sends queries and probes `/readyz`. It does **not** move the dnscrypt-proxy listener, which is fixed at `127.0.0.1:5300` in `config/dnscrypt-proxy.toml`. Leave unchanged unless you deliberately point the gateway at a different resolver. |
-| `DOH_MAX_BODY` | `8192` | Request DNS-message limit, up to `65535`. GET requests have additional HTTP-header overhead for Base64 expansion; the gateway sizes `MaxHeaderBytes` with headroom so over-limit GETs can still reach the handler and receive `413`. |
+| `DOH_MAX_BODY` | `8192` | Public request DNS-message limit; effective cap is the lower of this value and `DOH_MAX_TCP_FRAME`. GET requests have additional HTTP-header overhead for Base64 expansion; the gateway sizes `MaxHeaderBytes` with headroom so over-limit GETs can still reach the handler and receive `413`. |
 | `DOH_MAX_INFLIGHT` | `32` | Hard-capped at `64`. |
-| `DOH_MAX_CONNS` | `128` | Hard-capped at `256`. |
+| `DOH_MAX_CONNS` | `128` | Hard-capped at `256`; excess accepted connections are immediately closed. |
+| `DOH_RATE_RPS` | `10` | Per-source-IP token-bucket refill rate; hard-capped at `100`. |
+| `DOH_RATE_BURST` | `20` | Per-source-IP burst; hard-capped at `256`. |
+| `DOH_MAX_IP_CONNS` | `8` | Per-source-IP active connection cap; hard-capped at `32`. |
+| `DOH_MAX_IP_REQUESTS` | `8` | Per-source-IP concurrent request cap; hard-capped at `32`. |
+| `DOH_MAX_CLIENT_STATES` | `1024` | Bounded to `16`-`2048`, rounded to the 16 guard shards. |
+| `DOH_MAX_UDP_PACKET` | `8192` | Resolver-leg UDP packet limit; hard-capped at `65535`. |
+| `DOH_MAX_TCP_FRAME` | `8192` | Resolver-leg TCP DNS frame limit; hard-capped at `65535`. |
+| `DOH_TRUSTED_PROXY_CIDRS` | unset | Comma-separated trusted proxy prefixes; only then is `X-Forwarded-For` used. |
 | `GOMAXPROCS` | `1` | Recommended value for 0.25 vCPU. |
 | `DNSCRYPT_GOMEMLIMIT` | `192MiB` | dnscrypt-proxy Go heap target. |
 | `DOH_GOMEMLIMIT` | `24MiB` | gateway Go heap target. |
 | `PUBLIC_DOH_URL` | unset | Optional startup log only; does not change routing. |
 
-`DNS_LISTEN` and `SERVER_NAMES` are intentionally not runtime settings. The internal listener and resolver set remain fixed so deployment variables cannot accidentally change the topology or upstream policy.
+`DNS_LISTEN` and `SERVER_NAMES` are intentionally not runtime settings. The internal listener and resolver set remain fixed so deployment variables cannot accidentally change the topology or upstream policy. The TCP DNS fallback is intentionally one-shot: each connection handles exactly one query before closing.
 
 ## Health endpoints
 
@@ -168,6 +190,7 @@ Use a DoH-capable client for `/dns-query`; opening that URL directly in a browse
 │   └── dnscrypt-proxy.toml
 └── doh-gateway/
     ├── go.mod
+    ├── guard.go
     ├── main.go
     └── main_test.go
 ```
