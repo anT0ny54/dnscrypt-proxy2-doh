@@ -72,12 +72,31 @@ func env(key, fallback string) string {
 	return fallback
 }
 
+// envInt and envFloat are the single shared implementation for "read env var,
+// trim, parse, clamp to [min,max], fall back to a default on any parse
+// error" used throughout this package (by both the HTTP server setup here
+// and the client-guard/transport configuration in guard.go).
 func envInt(key string, fallback, min, max int) int {
 	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {
 		return fallback
 	}
 	n, err := strconv.Atoi(v)
+	if err != nil || n < min {
+		return fallback
+	}
+	if n > max {
+		return max
+	}
+	return n
+}
+
+func envFloat(key string, fallback, min, max float64) float64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.ParseFloat(v, 64)
 	if err != nil || n < min {
 		return fallback
 	}
@@ -309,10 +328,6 @@ func dnsExchangeWithLimits(ctx context.Context, addr string, q []byte, limits dn
 	return dnsExchangeTCP(ctx, addr, q, limits)
 }
 
-func dnsExchange(ctx context.Context, addr string, q []byte) ([]byte, error) {
-	return dnsExchangeWithLimits(ctx, addr, q, defaultDNSTransportLimits())
-}
-
 func upstreamReady(addr string) bool {
 	conn, err := net.DialTimeout("tcp", addr, readyProbeTimeout)
 	if err != nil {
@@ -327,11 +342,13 @@ func writeText(w http.ResponseWriter, status int, body string) {
 	_, _ = io.WriteString(w, body)
 }
 
-func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFunc {
-	return dohHandlerWithGuard(upstream, path, maxBody, maxInflight, defaultDNSTransportLimits(), nil, nil)
-}
-
-func dohHandlerWithGuard(upstream, path string, maxBody, maxInflight int, transport dnsTransportLimits, guard *clientGuard, trustedProxies []netip.Prefix) http.HandlerFunc {
+// effectiveDoHLimits normalizes the handler's configuration knobs the same
+// way dohHandlerWithGuard does internally, so that anything sizing other
+// parts of the server (e.g. net/http's MaxHeaderBytes) can be computed from
+// the same clamped values the handler actually enforces, rather than from
+// the raw, pre-clamp input. In particular maxBody can never exceed
+// transport.maxTCPFrame once this returns.
+func effectiveDoHLimits(maxBody, maxInflight int, transport dnsTransportLimits) (effMaxBody, effMaxInflight int, effTransport dnsTransportLimits) {
 	if maxBody < 12 || maxBody > maxDNSPacket {
 		maxBody = defaultMaxBody
 	}
@@ -346,6 +363,11 @@ func dohHandlerWithGuard(upstream, path string, maxBody, maxInflight int, transp
 	if maxBody > transport.maxTCPFrame {
 		maxBody = transport.maxTCPFrame
 	}
+	return maxBody, maxInflight, transport
+}
+
+func dohHandlerWithGuard(upstream, path string, maxBody, maxInflight int, transport dnsTransportLimits, guard *clientGuard, trustedProxies []netip.Prefix) http.HandlerFunc {
+	maxBody, maxInflight, transport = effectiveDoHLimits(maxBody, maxInflight, transport)
 	inflight := make(chan struct{}, maxInflight)
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -406,6 +428,26 @@ func dohHandlerWithGuard(upstream, path string, maxBody, maxInflight int, transp
 			defer guard.endRequest(sourceIP, time.Now())
 		}
 
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			w.Header().Set("Allow", "GET, POST, OPTIONS")
+			writeText(w, http.StatusMethodNotAllowed, "method not allowed\n")
+			return
+		}
+
+		// Acquire the in-flight slot before doing any work reading or decoding
+		// the query. At capacity this lets the gateway fail fast with a cheap
+		// 503 instead of first reading a POST body (which, for a body close to
+		// maxBody, is real allocation and I/O) only to discard it immediately
+		// afterward.
+		select {
+		case inflight <- struct{}{}:
+			defer func() { <-inflight }()
+		default:
+			w.Header().Set("Retry-After", "1")
+			writeText(w, http.StatusServiceUnavailable, "gateway at capacity, retry shortly\n")
+			return
+		}
+
 		var query []byte
 		switch r.Method {
 		case http.MethodGet:
@@ -453,20 +495,6 @@ func dohHandlerWithGuard(upstream, path string, maxBody, maxInflight int, transp
 				writeText(w, http.StatusBadRequest, "invalid DNS query\n")
 				return
 			}
-
-		default:
-			w.Header().Set("Allow", "GET, POST, OPTIONS")
-			writeText(w, http.StatusMethodNotAllowed, "method not allowed\n")
-			return
-		}
-
-		select {
-		case inflight <- struct{}{}:
-			defer func() { <-inflight }()
-		default:
-			w.Header().Set("Retry-After", "1")
-			writeText(w, http.StatusServiceUnavailable, "gateway at capacity, retry shortly\n")
-			return
 		}
 
 		response, err := dnsExchangeWithLimits(r.Context(), upstream, query, transport)
@@ -508,16 +536,21 @@ func main() {
 		path = "/dns-query"
 	}
 
+	// Normalize once, up front, so MaxHeaderBytes below is sized from exactly
+	// the same clamped maxBody that dohHandlerWithGuard will enforce, rather
+	// than from the raw pre-clamp DOH_MAX_BODY value.
+	effMaxBody, effMaxInflight, effTransport := effectiveDoHLimits(maxBody, maxInflight, transport)
+
 	bindHost := env("DOH_BIND", "0.0.0.0")
 	addr := net.JoinHostPort(bindHost, port)
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           dohHandlerWithGuard(upstream, path, maxBody, maxInflight, transport, guard, guardConfig.trustedProxyCIDRs),
+		Handler:           dohHandlerWithGuard(upstream, path, effMaxBody, effMaxInflight, effTransport, guard, guardConfig.trustedProxyCIDRs),
 		ReadHeaderTimeout: httpReadTimeout,
 		ReadTimeout:       httpReadTimeout,
 		WriteTimeout:      httpWriteTimeout,
 		IdleTimeout:       15 * time.Second,
-		MaxHeaderBytes:    maxHeaderBytesFor(maxBody),
+		MaxHeaderBytes:    maxHeaderBytesFor(effMaxBody),
 	}
 
 	ln, err := net.Listen("tcp", addr)
@@ -528,9 +561,9 @@ func main() {
 
 	log.Printf("DoH gateway listening on http://%s%s -> %s", addr, path, upstream)
 	log.Printf("health endpoints: http://%s/healthz and /readyz", net.JoinHostPort(bindHost, port))
-	log.Printf("limits: max %d in-flight exchanges, max %d TCP connections, max %d-byte DoH query", maxInflight, maxConns, maxBody)
+	log.Printf("limits: max %d in-flight exchanges, max %d TCP connections, max %d-byte DoH query", effMaxInflight, maxConns, effMaxBody)
 	log.Printf("abuse guard: %.1f rps / burst %d, max %d conns + %d requests per source IP, max %d client states", guardConfig.rps, guardConfig.burst, guardConfig.maxIPConns, guardConfig.maxIPRequests, guardConfig.maxClientStates)
-	log.Printf("DNS transport guard: UDP %d bytes, TCP frame %d bytes, max %d TCP queries/connection", transport.maxUDPPacket, transport.maxTCPFrame, transport.maxTCPQueries)
+	log.Printf("DNS transport guard: UDP %d bytes, TCP frame %d bytes, max %d TCP queries/connection", effTransport.maxUDPPacket, effTransport.maxTCPFrame, effTransport.maxTCPQueries)
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()

@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,8 +52,8 @@ func defaultDNSTransportLimits() dnsTransportLimits {
 func dnsTransportLimitsFromEnv() dnsTransportLimits {
 	defaults := defaultDNSTransportLimits()
 	return dnsTransportLimits{
-		maxUDPPacket:  guardEnvInt("DOH_MAX_UDP_PACKET", defaults.maxUDPPacket, 512, maxDoHTransportSize),
-		maxTCPFrame:   guardEnvInt("DOH_MAX_TCP_FRAME", defaults.maxTCPFrame, 512, maxDoHTransportSize),
+		maxUDPPacket:  envInt("DOH_MAX_UDP_PACKET", defaults.maxUDPPacket, 512, maxDoHTransportSize),
+		maxTCPFrame:   envInt("DOH_MAX_TCP_FRAME", defaults.maxTCPFrame, 512, maxDoHTransportSize),
 		maxTCPQueries: defaults.maxTCPQueries,
 	}
 }
@@ -70,11 +69,11 @@ type clientGuardConfig struct {
 }
 
 func clientGuardConfigFromEnv() (clientGuardConfig, error) {
-	rps := guardEnvFloat("DOH_RATE_RPS", defaultDoHRPS, 0.1, maxDoHRPS)
-	burst := guardEnvInt("DOH_RATE_BURST", defaultDoHBurst, 1, maxDoHBurst)
-	maxIPConns := guardEnvInt("DOH_MAX_IP_CONNS", defaultDoHIPConns, 1, maxDoHIPConns)
-	maxIPRequests := guardEnvInt("DOH_MAX_IP_REQUESTS", defaultDoHIPRequests, 1, maxDoHIPRequests)
-	maxStates := guardEnvInt("DOH_MAX_CLIENT_STATES", defaultDoHClientStates, minDoHClientStates, maxDoHClientStates)
+	rps := envFloat("DOH_RATE_RPS", defaultDoHRPS, 0.1, maxDoHRPS)
+	burst := envInt("DOH_RATE_BURST", defaultDoHBurst, 1, maxDoHBurst)
+	maxIPConns := envInt("DOH_MAX_IP_CONNS", defaultDoHIPConns, 1, maxDoHIPConns)
+	maxIPRequests := envInt("DOH_MAX_IP_REQUESTS", defaultDoHIPRequests, 1, maxDoHIPRequests)
+	maxStates := envInt("DOH_MAX_CLIENT_STATES", defaultDoHClientStates, minDoHClientStates, maxDoHClientStates)
 	maxStates = (maxStates / clientGuardShardCount) * clientGuardShardCount
 	if maxStates < minDoHClientStates {
 		maxStates = minDoHClientStates
@@ -94,36 +93,6 @@ func clientGuardConfigFromEnv() (clientGuardConfig, error) {
 		stateTTL:          defaultDoHStateTTL,
 		trustedProxyCIDRs: cidrs,
 	}, nil
-}
-
-func guardEnvInt(key string, fallback, min, max int) int {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return fallback
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n < min {
-		return fallback
-	}
-	if n > max {
-		return max
-	}
-	return n
-}
-
-func guardEnvFloat(key string, fallback, min, max float64) float64 {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return fallback
-	}
-	n, err := strconv.ParseFloat(v, 64)
-	if err != nil || n < min {
-		return fallback
-	}
-	if n > max {
-		return max
-	}
-	return n
 }
 
 func parseTrustedProxyCIDRs(value string) ([]netip.Prefix, error) {

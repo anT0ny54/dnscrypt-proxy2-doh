@@ -307,12 +307,12 @@ func TestDNSExchangeTruncatedUDPFallsBackToTCP(t *testing.T) {
 	}()
 
 	query := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
-	got, err := dnsExchange(context.Background(), "127.0.0.1:"+strconv.Itoa(port), query)
+	got, err := dnsExchangeWithLimits(context.Background(), "127.0.0.1:"+strconv.Itoa(port), query, defaultDNSTransportLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(got) != string(want) {
-		t.Fatalf("dnsExchange() = %x, want %x", got, want)
+		t.Fatalf("dnsExchangeWithLimits() = %x, want %x", got, want)
 	}
 }
 
@@ -339,13 +339,13 @@ func TestDNSExchangeUDPResponseIsNotAliasedToPooledBuffer(t *testing.T) {
 	q1 := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
 	q2 := []byte{0, 2, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
 
-	first, err := dnsExchange(context.Background(), addr, q1)
+	first, err := dnsExchangeWithLimits(context.Background(), addr, q1, defaultDNSTransportLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
 	// A second exchange reuses the pooled receive buffer; it must not
 	// overwrite the response already returned by the first.
-	if _, err := dnsExchange(context.Background(), addr, q2); err != nil {
+	if _, err := dnsExchangeWithLimits(context.Background(), addr, q2, defaultDNSTransportLimits()); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(first, q1) {
@@ -367,15 +367,15 @@ func TestDNSExchangeUDPTimeoutDoesNotFallBackToTCP(t *testing.T) {
 
 	query := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
 	start := time.Now()
-	_, err = dnsExchange(ctx, udp.LocalAddr().String(), query)
+	_, err = dnsExchangeWithLimits(ctx, udp.LocalAddr().String(), query, defaultDNSTransportLimits())
 	if err == nil {
-		t.Fatal("dnsExchange() expected an error from an unresponsive upstream")
+		t.Fatal("dnsExchangeWithLimits() expected an error from an unresponsive upstream")
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("dnsExchange() took %s, want it bounded by the context deadline", elapsed)
+		t.Fatalf("dnsExchangeWithLimits() took %s, want it bounded by the context deadline", elapsed)
 	}
 	if strings.Contains(err.Error(), "dial tcp") {
-		t.Fatalf("dnsExchange() error = %v, want the UDP error, not a TCP dial error", err)
+		t.Fatalf("dnsExchangeWithLimits() error = %v, want the UDP error, not a TCP dial error", err)
 	}
 }
 
@@ -411,7 +411,7 @@ func TestDoHHandlerGetStandardBase64Plus(t *testing.T) {
 		t.Fatalf("test fixture must contain '+': %q", encoded)
 	}
 
-	h := dohHandler(addr, "/dns-query", maxDNSPacket, 1)
+	h := dohHandlerWithGuard(addr, "/dns-query", maxDNSPacket, 1, defaultDNSTransportLimits(), nil, nil)
 	for name, value := range map[string]string{
 		"literal plus": encoded,
 		"escaped plus": strings.ReplaceAll(encoded, "+", "%2B"),
@@ -434,7 +434,7 @@ func TestDoHHandlerGetStandardBase64Plus(t *testing.T) {
 func TestDoHServerGetOverMaxBodyReachesHandler(t *testing.T) {
 	const maxBody = 8 << 10
 
-	h := dohHandler("127.0.0.1:1", "/dns-query", maxBody, 1)
+	h := dohHandlerWithGuard("127.0.0.1:1", "/dns-query", maxBody, 1, defaultDNSTransportLimits(), nil, nil)
 	srv := httptest.NewUnstartedServer(h)
 	srv.Config.MaxHeaderBytes = maxHeaderBytesFor(maxBody)
 	srv.Start()
@@ -459,7 +459,7 @@ func TestDoHServerGetOverMaxBodyReachesHandler(t *testing.T) {
 
 func TestDoHHandlerGetRejectsQueryOverMaxBody(t *testing.T) {
 	const smallMaxBody = 16
-	h := dohHandler("127.0.0.1:1", "/dns-query", smallMaxBody, 1)
+	h := dohHandlerWithGuard("127.0.0.1:1", "/dns-query", smallMaxBody, 1, defaultDNSTransportLimits(), nil, nil)
 
 	query := make([]byte, smallMaxBody+1)
 	query[2] = 0
@@ -475,7 +475,7 @@ func TestDoHHandlerGetRejectsQueryOverMaxBody(t *testing.T) {
 
 func TestDoHHandlerRejectsDNSResponseMessage(t *testing.T) {
 	query := []byte{0, 2, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0}
-	h := dohHandler("127.0.0.1:1", "/dns-query", maxDNSPacket, 1)
+	h := dohHandlerWithGuard("127.0.0.1:1", "/dns-query", maxDNSPacket, 1, defaultDNSTransportLimits(), nil, nil)
 
 	postReq := httptest.NewRequest("POST", "/dns-query", bytes.NewReader(query))
 	postRec := httptest.NewRecorder()
@@ -506,7 +506,7 @@ func TestDoHHandlerGetAndPost(t *testing.T) {
 	}()
 
 	query := []byte{0, 2, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
-	h := dohHandler(addr, "/dns-query", maxDNSPacket, 1)
+	h := dohHandlerWithGuard(addr, "/dns-query", maxDNSPacket, 1, defaultDNSTransportLimits(), nil, nil)
 
 	postReq := httptest.NewRequest("POST", "/dns-query", bytes.NewReader(query))
 	postReq.Header.Set("Content-Type", "application/dns-message")
@@ -584,7 +584,7 @@ func TestReadyEndpoint(t *testing.T) {
 	}
 	defer ln.Close()
 
-	h := dohHandler(ln.Addr().String(), "/dns-query", maxDNSPacket, 1)
+	h := dohHandlerWithGuard(ln.Addr().String(), "/dns-query", maxDNSPacket, 1, defaultDNSTransportLimits(), nil, nil)
 	req := httptest.NewRequest("GET", "/readyz", nil)
 	rec := httptest.NewRecorder()
 	h(rec, req)
@@ -605,7 +605,7 @@ func TestReadyEndpointUnavailable(t *testing.T) {
 	addr := ln.Addr().String()
 	_ = ln.Close()
 
-	h := dohHandler(addr, "/dns-query", maxDNSPacket, 1)
+	h := dohHandlerWithGuard(addr, "/dns-query", maxDNSPacket, 1, defaultDNSTransportLimits(), nil, nil)
 	req := httptest.NewRequest("GET", "/readyz", nil)
 	rec := httptest.NewRecorder()
 	h(rec, req)
