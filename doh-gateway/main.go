@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -84,58 +85,6 @@ func envInt(key string, fallback, min, max int) int {
 		return max
 	}
 	return n
-}
-
-// limitListener bounds simultaneously open TCP connections without making
-// shutdown dependent on an Accept call that is blocked waiting for capacity.
-type limitListener struct {
-	net.Listener
-	sem      chan struct{}
-	done     chan struct{}
-	closeOne sync.Once
-}
-
-func newLimitListener(l net.Listener, maxConns int) net.Listener {
-	if maxConns < 1 {
-		maxConns = 1
-	}
-	return &limitListener{
-		Listener: l,
-		sem:      make(chan struct{}, maxConns),
-		done:     make(chan struct{}),
-	}
-}
-
-func (l *limitListener) Accept() (net.Conn, error) {
-	select {
-	case l.sem <- struct{}{}:
-	case <-l.done:
-		return nil, net.ErrClosed
-	}
-
-	c, err := l.Listener.Accept()
-	if err != nil {
-		<-l.sem
-		return nil, err
-	}
-	return &limitListenerConn{Conn: c, release: l.sem}, nil
-}
-
-func (l *limitListener) Close() error {
-	l.closeOne.Do(func() { close(l.done) })
-	return l.Listener.Close()
-}
-
-type limitListenerConn struct {
-	net.Conn
-	release chan struct{}
-	once    sync.Once
-}
-
-func (c *limitListenerConn) Close() error {
-	err := c.Conn.Close()
-	c.once.Do(func() { <-c.release })
-	return err
 }
 
 // decodeQuery decodes a DoH "dns" GET parameter, which in practice arrives in
@@ -250,10 +199,10 @@ func setConnDeadline(ctx context.Context, conn net.Conn) {
 	_ = conn.SetDeadline(deadline)
 }
 
-// udpBufPool recycles the receive buffer for UDP responses. The buffer must be
-// the full 64 KiB: a UDP read into a smaller slice silently drops the excess
-// without setting the TC bit, which would corrupt large EDNS responses. Without
-// the pool every request allocates 64 KiB, which is heavy GC churn under the
+// udpBufPool recycles the receive buffer for UDP responses. It stays at the DNS
+// wire maximum so the guard can distinguish normal packets from oversized
+// datagrams without allocating a second buffer on the hot path. Without the
+// pool every request allocates 64 KiB, which is heavy GC churn under the
 // gateway's small (24 MiB) heap target.
 var udpBufPool = sync.Pool{
 	New: func() any {
@@ -262,7 +211,7 @@ var udpBufPool = sync.Pool{
 	},
 }
 
-func dnsExchangeUDP(ctx context.Context, addr string, q []byte) ([]byte, error) {
+func dnsExchangeUDP(ctx context.Context, addr string, q []byte, maxUDPPacket int) ([]byte, error) {
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "udp", addr)
 	if err != nil {
@@ -272,6 +221,9 @@ func dnsExchangeUDP(ctx context.Context, addr string, q []byte) ([]byte, error) 
 	defer watchCancel(ctx, conn)()
 	setConnDeadline(ctx, conn)
 
+	if len(q) == 0 || len(q) > maxUDPPacket {
+		return nil, errors.New("DNS query exceeds UDP packet limit")
+	}
 	if _, err := conn.Write(q); err != nil {
 		return nil, err
 	}
@@ -279,18 +231,26 @@ func dnsExchangeUDP(ctx context.Context, addr string, q []byte) ([]byte, error) 
 	bufp := udpBufPool.Get().(*[]byte)
 	defer udpBufPool.Put(bufp)
 
-	n, err := conn.Read(*bufp)
-	if err != nil {
-		return nil, err
+	for {
+		n, err := conn.Read(*bufp)
+		if err != nil {
+			return nil, err
+		}
+		if n > maxUDPPacket {
+			// UDP overflow is an abuse/garbage case at this layer. The datagram
+			// has already been fully discarded by the kernel; keep waiting for a
+			// bounded time instead of turning it into a second allocation/parse.
+			continue
+		}
+		if n < 12 {
+			return nil, errors.New("short DNS response")
+		}
+		// Copy out: the pooled buffer is reused as soon as this function returns.
+		return append([]byte(nil), (*bufp)[:n]...), nil
 	}
-	if n < 12 {
-		return nil, errors.New("short DNS response")
-	}
-	// Copy out: the pooled buffer is reused as soon as this function returns.
-	return append([]byte(nil), (*bufp)[:n]...), nil
 }
 
-func dnsExchangeTCP(ctx context.Context, addr string, q []byte) ([]byte, error) {
+func dnsExchangeTCP(ctx context.Context, addr string, q []byte, limits dnsTransportLimits) ([]byte, error) {
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -298,34 +258,17 @@ func dnsExchangeTCP(ctx context.Context, addr string, q []byte) ([]byte, error) 
 	}
 	defer conn.Close()
 	defer watchCancel(ctx, conn)()
-	setConnDeadline(ctx, conn)
 
-	frame := []byte{byte(len(q) >> 8), byte(len(q))}
-	frame = append(frame, q...)
-	if _, err := conn.Write(frame); err != nil {
-		return nil, err
+	tcpConn := guardedTCPDNSConn{
+		conn:       conn,
+		maxFrame:   limits.maxTCPFrame,
+		maxQueries: limits.maxTCPQueries,
 	}
-
-	var hdr [2]byte
-	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
-		return nil, err
-	}
-	n := int(hdr[0])<<8 | int(hdr[1])
-	if n <= 0 || n > maxDNSPacket {
-		return nil, errors.New("invalid TCP DNS response size")
-	}
-	buf := make([]byte, n)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return nil, err
-	}
-	if len(buf) < 12 {
-		return nil, errors.New("short DNS response")
-	}
-	return buf, nil
+	return tcpConn.exchange(ctx, q)
 }
 
-func dnsExchange(ctx context.Context, addr string, q []byte) ([]byte, error) {
-	if len(q) == 0 || len(q) > maxDNSPacket {
+func dnsExchangeWithLimits(ctx context.Context, addr string, q []byte, limits dnsTransportLimits) ([]byte, error) {
+	if len(q) == 0 || len(q) > maxDNSPacket || len(q) > limits.maxTCPFrame {
 		return nil, errors.New("invalid DNS message size")
 	}
 	// Note: DNS query validation (minimum length, QR bit) is performed by the
@@ -337,11 +280,16 @@ func dnsExchange(ctx context.Context, addr string, q []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, dnsExchangeTimeout)
 	defer cancel()
 
+	// Messages larger than the configured UDP packet budget go straight to TCP.
+	if len(q) > limits.maxUDPPacket {
+		return dnsExchangeTCP(ctx, addr, q, limits)
+	}
+
 	// UDP is the common local transport. A truncated response is retried over TCP.
-	response, udpErr := dnsExchangeUDP(ctx, addr, q)
+	response, udpErr := dnsExchangeUDP(ctx, addr, q, limits.maxUDPPacket)
 	if udpErr == nil {
 		if len(response) >= 4 && (response[2]&0x02) != 0 {
-			tcpResponse, tcpErr := dnsExchangeTCP(ctx, addr, q)
+			tcpResponse, tcpErr := dnsExchangeTCP(ctx, addr, q, limits)
 			if tcpErr != nil {
 				return nil, fmt.Errorf("TCP fallback: %w", tcpErr)
 			}
@@ -358,7 +306,11 @@ func dnsExchange(ctx context.Context, addr string, q []byte) ([]byte, error) {
 		return nil, udpErr
 	}
 
-	return dnsExchangeTCP(ctx, addr, q)
+	return dnsExchangeTCP(ctx, addr, q, limits)
+}
+
+func dnsExchange(ctx context.Context, addr string, q []byte) ([]byte, error) {
+	return dnsExchangeWithLimits(ctx, addr, q, defaultDNSTransportLimits())
 }
 
 func upstreamReady(addr string) bool {
@@ -376,11 +328,23 @@ func writeText(w http.ResponseWriter, status int, body string) {
 }
 
 func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFunc {
+	return dohHandlerWithGuard(upstream, path, maxBody, maxInflight, defaultDNSTransportLimits(), nil, nil)
+}
+
+func dohHandlerWithGuard(upstream, path string, maxBody, maxInflight int, transport dnsTransportLimits, guard *clientGuard, trustedProxies []netip.Prefix) http.HandlerFunc {
 	if maxBody < 12 || maxBody > maxDNSPacket {
 		maxBody = defaultMaxBody
 	}
 	if maxInflight < 1 || maxInflight > maxMaxInflight {
 		maxInflight = defaultMaxInflight
+	}
+	// Keep HTTP request size and the TCP frame guard aligned. UDP-sized queries
+	// can use UDP directly; larger queries are sent to the one-shot TCP path.
+	if transport.maxTCPFrame < 12 {
+		transport.maxTCPFrame = defaultMaxTCPFrame
+	}
+	if maxBody > transport.maxTCPFrame {
+		maxBody = transport.maxTCPFrame
 	}
 	inflight := make(chan struct{}, maxInflight)
 
@@ -429,6 +393,17 @@ func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFun
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
+		}
+
+		var sourceIP netip.Addr
+		if guard != nil {
+			sourceIP = requestClientIP(r, trustedProxies)
+			if !guard.beginRequest(sourceIP, time.Now()) {
+				w.Header().Set("Retry-After", "1")
+				writeText(w, http.StatusTooManyRequests, "client rate/concurrency limit exceeded\n")
+				return
+			}
+			defer guard.endRequest(sourceIP, time.Now())
 		}
 
 		var query []byte
@@ -494,7 +469,7 @@ func dohHandler(upstream, path string, maxBody, maxInflight int) http.HandlerFun
 			return
 		}
 
-		response, err := dnsExchange(r.Context(), upstream, query)
+		response, err := dnsExchangeWithLimits(r.Context(), upstream, query, transport)
 		if err != nil {
 			if r.Context().Err() != nil {
 				// The client disconnected; there is nobody to answer and
@@ -520,6 +495,12 @@ func main() {
 	maxBody := envInt("DOH_MAX_BODY", defaultMaxBody, 12, maxDNSPacket)
 	maxInflight := envInt("DOH_MAX_INFLIGHT", defaultMaxInflight, 1, maxMaxInflight)
 	maxConns := envInt("DOH_MAX_CONNS", defaultMaxConns, 1, maxMaxConns)
+	transport := dnsTransportLimitsFromEnv()
+	guardConfig, err := clientGuardConfigFromEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
+	guard := newClientGuard(guardConfig)
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
@@ -531,7 +512,7 @@ func main() {
 	addr := net.JoinHostPort(bindHost, port)
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           dohHandler(upstream, path, maxBody, maxInflight),
+		Handler:           dohHandlerWithGuard(upstream, path, maxBody, maxInflight, transport, guard, guardConfig.trustedProxyCIDRs),
 		ReadHeaderTimeout: httpReadTimeout,
 		ReadTimeout:       httpReadTimeout,
 		WriteTimeout:      httpWriteTimeout,
@@ -543,11 +524,13 @@ func main() {
 	if err != nil {
 		log.Fatal(fmt.Errorf("DoH gateway: listen: %w", err))
 	}
-	ln = newLimitListener(ln, maxConns)
+	ln = newGuardListener(ln, guard, maxConns)
 
 	log.Printf("DoH gateway listening on http://%s%s -> %s", addr, path, upstream)
 	log.Printf("health endpoints: http://%s/healthz and /readyz", net.JoinHostPort(bindHost, port))
-	log.Printf("limits: max %d in-flight exchanges, max %d connections, max %d-byte query", maxInflight, maxConns, maxBody)
+	log.Printf("limits: max %d in-flight exchanges, max %d TCP connections, max %d-byte DoH query", maxInflight, maxConns, maxBody)
+	log.Printf("abuse guard: %.1f rps / burst %d, max %d conns + %d requests per source IP, max %d client states", guardConfig.rps, guardConfig.burst, guardConfig.maxIPConns, guardConfig.maxIPRequests, guardConfig.maxClientStates)
+	log.Printf("DNS transport guard: UDP %d bytes, TCP frame %d bytes, max %d TCP queries/connection", transport.maxUDPPacket, transport.maxTCPFrame, transport.maxTCPQueries)
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strconv"
 	"strings"
 	"testing"
@@ -44,24 +46,106 @@ func TestValidateDNSQuery(t *testing.T) {
 	}
 }
 
-func TestLimitListenerShutdownWhenFull(t *testing.T) {
+func TestClientGuardRateAndConcurrency(t *testing.T) {
+	cfg := clientGuardConfig{
+		rps:             1,
+		burst:           2,
+		maxIPConns:      1,
+		maxIPRequests:   1,
+		maxClientStates: 16,
+		stateTTL:        5 * time.Minute,
+	}
+	g := newClientGuard(cfg)
+	ip := netip.MustParseAddr("198.51.100.10")
+	t0 := time.Unix(0, 0)
+
+	if !g.beginRequest(ip, t0) {
+		t.Fatal("first request was rejected")
+	}
+	if g.beginRequest(ip, t0) {
+		t.Fatal("per-IP concurrent request limit was not enforced")
+	}
+	g.endRequest(ip, t0)
+	if !g.beginRequest(ip, t0) {
+		t.Fatal("second request should consume the burst token")
+	}
+	g.endRequest(ip, t0)
+	if g.beginRequest(ip, t0) {
+		t.Fatal("token bucket allowed a third immediate request")
+	}
+	if !g.beginRequest(ip, t0.Add(time.Second)) {
+		t.Fatal("token bucket did not refill after one second")
+	}
+	g.endRequest(ip, t0.Add(time.Second))
+
+	if !g.openConnection(ip, t0) {
+		t.Fatal("first connection was rejected")
+	}
+	if g.openConnection(ip, t0) {
+		t.Fatal("per-IP connection limit was not enforced")
+	}
+	g.closeConnection(ip, t0)
+}
+
+func TestClientGuardStateIsBounded(t *testing.T) {
+	cfg := clientGuardConfig{
+		rps:             10,
+		burst:           10,
+		maxIPConns:      1,
+		maxIPRequests:   1,
+		maxClientStates: 16,
+		stateTTL:        5 * time.Minute,
+	}
+	g := newClientGuard(cfg)
+	now := time.Unix(0, 0)
+
+	for i := 0; i < 5000; i++ {
+		ip := netip.AddrFrom4([4]byte{198, 51, byte(i >> 8), byte(i)})
+		if !g.beginRequest(ip, now) {
+			// A shard can be temporarily full of the same active entry, but the
+			// request is immediately released in this test so state remains bounded.
+			continue
+		}
+		g.endRequest(ip, now)
+	}
+	if got := g.stateCount(); got > cfg.maxClientStates {
+		t.Fatalf("client state count = %d, want <= %d", got, cfg.maxClientStates)
+	}
+}
+
+func TestGuardListenerImmediateCloseWhenGlobalFull(t *testing.T) {
 	base, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ln := newLimitListener(base, 1)
+	cfg := clientGuardConfig{
+		rps:             10,
+		burst:           10,
+		maxIPConns:      4,
+		maxIPRequests:   4,
+		maxClientStates: 16,
+		stateTTL:        5 * time.Minute,
+	}
+	guard := newClientGuard(cfg)
+	ln := newGuardListener(base, guard, 1)
+	defer ln.Close()
 
-	client, err := net.Dial("tcp", base.Addr().String())
+	firstClient, err := net.Dial("tcp", base.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.Close()
-
-	accepted, err := ln.Accept()
+	defer firstClient.Close()
+	firstAccepted, err := ln.Accept()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer accepted.Close()
+	defer firstAccepted.Close()
+
+	secondClient, err := net.Dial("tcp", base.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondClient.Close()
 
 	acceptDone := make(chan error, 1)
 	go func() {
@@ -69,18 +153,110 @@ func TestLimitListenerShutdownWhenFull(t *testing.T) {
 		acceptDone <- err
 	}()
 
-	time.Sleep(25 * time.Millisecond)
+	if err := secondClient.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var one [1]byte
+	if _, err := secondClient.Read(one[:]); err == nil {
+		t.Fatal("second connection stayed open while the global limit was full")
+	}
+
 	if err := ln.Close(); err != nil {
 		t.Fatal(err)
 	}
-
 	select {
 	case err := <-acceptDone:
 		if err == nil {
-			t.Fatal("blocked Accept unexpectedly returned a connection")
+			t.Fatal("Accept returned nil after listener shutdown")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("blocked Accept did not unblock after listener shutdown")
+		t.Fatal("Accept did not unblock after listener shutdown")
+	}
+}
+
+func TestRequestClientIPTrustsOnlyConfiguredProxy(t *testing.T) {
+	prefix := netip.MustParsePrefix("192.0.2.0/24")
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/dns-query", nil)
+	req.RemoteAddr = "192.0.2.10:12345"
+	req.Header.Set("X-Forwarded-For", "198.51.100.7, 192.0.2.11")
+	if got := requestClientIP(req, []netip.Prefix{prefix}); got.String() != "198.51.100.7" {
+		t.Fatalf("trusted proxy client IP = %s, want 198.51.100.7", got)
+	}
+
+	req.RemoteAddr = "203.0.113.10:12345"
+	if got := requestClientIP(req, []netip.Prefix{prefix}); got.String() != "203.0.113.10" {
+		t.Fatalf("untrusted peer accepted forwarded IP %s", got)
+	}
+}
+
+func TestGuardedTCPDNSConnEnforcesQueryCountAndFrameSize(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	response := []byte{0, 1, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0}
+	go func() {
+		var hdr [2]byte
+		if _, err := io.ReadFull(server, hdr[:]); err != nil {
+			return
+		}
+		n := int(hdr[0])<<8 | int(hdr[1])
+		q := make([]byte, n)
+		if _, err := io.ReadFull(server, q); err != nil {
+			return
+		}
+		frame := append([]byte{byte(len(response) >> 8), byte(len(response))}, response...)
+		_, _ = server.Write(frame)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	tcpConn := guardedTCPDNSConn{conn: client, maxFrame: 64, maxQueries: 1}
+	query := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	got, err := tcpConn.exchange(ctx, query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, response) {
+		t.Fatalf("guarded TCP response = %x, want %x", got, response)
+	}
+	if _, err := tcpConn.exchange(ctx, query); !errors.Is(err, errTCPQueriesExceeded) {
+		t.Fatalf("second TCP query error = %v, want %v", err, errTCPQueriesExceeded)
+	}
+
+	large := make([]byte, 65)
+	if _, err := (&guardedTCPDNSConn{conn: client, maxFrame: 64, maxQueries: 1}).exchange(ctx, large); err == nil {
+		t.Fatal("oversized TCP query was accepted")
+	}
+}
+
+func TestDNSExchangeUDPDropsOversizedDatagram(t *testing.T) {
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+	addr := udp.LocalAddr().String()
+
+	query := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	want := append([]byte(nil), query...)
+	go func() {
+		buf := make([]byte, maxDNSPacket)
+		n, client, err := udp.ReadFromUDP(buf)
+		if err != nil || n != len(query) {
+			return
+		}
+		oversized := make([]byte, 129)
+		_, _ = udp.WriteToUDP(oversized, client)
+		_, _ = udp.WriteToUDP(want, client)
+	}()
+
+	got, err := dnsExchangeUDP(context.Background(), addr, query, 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("UDP response after overflow = %x, want %x", got, want)
 	}
 }
 
@@ -352,6 +528,52 @@ func TestDoHHandlerGetAndPost(t *testing.T) {
 	}
 	if got := getRec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Fatalf("GET CORS origin = %q", got)
+	}
+}
+
+func TestDoHHandlerAppliesClientGuard(t *testing.T) {
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+	addr := udp.LocalAddr().String()
+
+	query := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	go func() {
+		buf := make([]byte, maxDNSPacket)
+		n, client, err := udp.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		_, _ = udp.WriteToUDP(buf[:n], client)
+	}()
+
+	guard := newClientGuard(clientGuardConfig{
+		rps:             1,
+		burst:           1,
+		maxIPConns:      8,
+		maxIPRequests:   8,
+		maxClientStates: 16,
+		stateTTL:        5 * time.Minute,
+	})
+	h := dohHandlerWithGuard(addr, "/dns-query", maxDNSPacket, 1, defaultDNSTransportLimits(), guard, nil)
+	encoded := base64.RawURLEncoding.EncodeToString(query)
+
+	req1 := httptest.NewRequest(http.MethodGet, "/dns-query?dns="+encoded, nil)
+	req1.RemoteAddr = "198.51.100.20:1234"
+	rec1 := httptest.NewRecorder()
+	h(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first guarded request status = %d, want %d", rec1.Code, http.StatusOK)
+	}
+
+	req2 := httptest.NewRequest(http.MethodGet, "/dns-query?dns="+encoded, nil)
+	req2.RemoteAddr = "198.51.100.20:5678"
+	rec2 := httptest.NewRecorder()
+	h(rec2, req2)
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second guarded request status = %d, want %d", rec2.Code, http.StatusTooManyRequests)
 	}
 }
 
