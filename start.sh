@@ -14,7 +14,24 @@ doh_gomemlimit="${DOH_GOMEMLIMIT:-24MiB}"
 public_doh_url="${PUBLIC_DOH_URL:-}"
 doh_upstream="${DOH_UPSTREAM_ADDR:-$dns_listen}"
 
-# Validate the checked-in configuration before starting either service.
+# dnscrypt-proxy's max_clients is the resolver's own client concurrency
+# ceiling; it must not sit below the DoH gateway's own DOH_MAX_INFLIGHT or
+# the gateway can admit more concurrent exchanges than the resolver behind
+# it will actually service, silently reintroducing backpressure at the
+# resolver even after DOH_MAX_INFLIGHT is raised. Rather than keep a second,
+# independent value hardcoded in the checked-in TOML, derive it here from
+# the same env var and the same fallback (32) the Go binary uses.
+doh_max_inflight="${DOH_MAX_INFLIGHT:-32}"
+case "$doh_max_inflight" in
+    ''|*[!0-9]*)
+        echo "WARNING: DOH_MAX_INFLIGHT=\"$doh_max_inflight\" is not a positive integer; using 32 for dnscrypt-proxy max_clients." >&2
+        doh_max_inflight=32
+        ;;
+esac
+sed -i "s/^max_clients = .*/max_clients = ${doh_max_inflight}/" "$CONFIG_FILE"
+
+# Validate the checked-in configuration (with max_clients now synced to
+# DOH_MAX_INFLIGHT above) before starting either service.
 echo "Checking dnscrypt-proxy configuration..."
 if ! "$DNSCRYPT_BIN" -config "$CONFIG_FILE" -check; then
     echo "ERROR: dnscrypt-proxy configuration check failed." >&2
@@ -22,7 +39,7 @@ if ! "$DNSCRYPT_BIN" -config "$CONFIG_FILE" -check; then
 fi
 
 echo "Starting dnscrypt-proxy 2 + DoH gateway"
-echo "  dnscrypt-proxy : $dns_listen"
+echo "  dnscrypt-proxy : $dns_listen (max_clients=$doh_max_inflight, synced to DOH_MAX_INFLIGHT)"
 echo "  resolvers      : HaGeZiDNS1, HaGeZiDNS2, HaGeZiDNS3 (static)"
 echo "  DoH endpoint   : ${doh_bind}:$port$doh_path"
 echo "  memory target  : ${dnscrypt_gomemlimit} dnscrypt-proxy + ${doh_gomemlimit} doh-gateway"
