@@ -27,7 +27,7 @@ Only the HTTP DoH gateway is intended to be public. The resolver listener is loo
 
 - **dnscrypt-proxy 2.1.18** — latest formal upstream GitHub release as of 2026-09-18.
 - **Go 1.27.1** — current Go 1.27 patch release used by the builder.
-- **Alpine 3.24.2** — current Alpine 3.24 patch release used by the runtime image.
+- **Alpine 3.24** — the builder and runtime both use the same pinned Alpine 3.24 release branch, so patch updates stay aligned.
 
 Upstream's `master` changelog already contains a **2.1.19** section, but it is not shown as a formal release in the upstream release index. This deployment therefore stays on the tagged 2.1.18 release rather than building from an unreleased branch.
 
@@ -62,7 +62,7 @@ The default limits are intentionally bounded for the small instance:
 | `cert_refresh_concurrency` | `2` | Keeps maintenance work low on 0.25 vCPU. |
 | upstream HTTP keepalive | `30s` | Favors connection reuse and avoids repeated TLS setup. |
 
-The gateway also caps request headers at **8 KiB**, uses a **5-second** read timeout, a **7-second** write timeout, and a **15-second** idle timeout. Each DNS exchange gets one combined **5-second** budget, including a possible UDP-to-TCP retry.
+The gateway sizes request headers with Base64 GET headroom instead of capping them at the 8 KiB DNS-message limit, uses a **5-second** read timeout, a **7-second** write timeout, and a **15-second** idle timeout. Each DNS exchange gets one combined **5-second** budget, including a possible UDP-to-TCP retry.
 
 The 7-second HTTP write deadline deliberately exceeds the 5-second DNS budget because Go's `net/http` write deadline covers the whole request handling interval, not only the final socket write.
 
@@ -102,7 +102,7 @@ Safe defaults are built into the image. Normally only `PORT` needs to match the 
 | `DOH_BIND` | `0.0.0.0` | Public gateway bind address. |
 | `DOH_PATH` | `/dns-query` | Public DoH path; `/`, `/healthz`, and `/readyz` are reserved. |
 | `DOH_UPSTREAM_ADDR` | `127.0.0.1:5300` | Where the gateway sends queries and probes `/readyz`. It does **not** move the dnscrypt-proxy listener, which is fixed at `127.0.0.1:5300` in `config/dnscrypt-proxy.toml`. Leave unchanged unless you deliberately point the gateway at a different resolver. |
-| `DOH_MAX_BODY` | `8192` | Request DNS-message limit, up to `65535`. `GET` queries are additionally bounded by the 8 KiB header limit (base64url adds ~33%), so very large messages need `POST`. |
+| `DOH_MAX_BODY` | `8192` | Request DNS-message limit, up to `65535`. GET requests have additional HTTP-header overhead for Base64 expansion; the gateway sizes `MaxHeaderBytes` with headroom so over-limit GETs can still reach the handler and receive `413`. |
 | `DOH_MAX_INFLIGHT` | `32` | Hard-capped at `64`. |
 | `DOH_MAX_CONNS` | `128` | Hard-capped at `256`. |
 | `GOMAXPROCS` | `1` | Recommended value for 0.25 vCPU. |

@@ -2,11 +2,11 @@
 
 ARG DNSCRYPT_VERSION=2.1.18
 ARG GO_VERSION=1.27.1
-ARG ALPINE_VERSION=3.24.2
+ARG ALPINE_VERSION=3.24
 
 # Build on the requested target platform and cross-compile the two static Go
 # binaries. The Go patch version and dnscrypt-proxy release are pinned.
-FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine3.24 AS build
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS build
 
 ARG DNSCRYPT_VERSION
 ARG TARGETOS
