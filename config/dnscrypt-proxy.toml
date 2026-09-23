@@ -18,12 +18,9 @@ server_names = ['HaGeZiDNS1', 'HaGeZiDNS2', 'HaGeZiDNS3']
 # Only the local DoH gateway can reach the resolver.
 listen_addresses = ['127.0.0.1:5300']
 
-# Match the gateway's maximum concurrent DNS work (DOH_MAX_INFLIGHT) for
-# predictable backpressure on a 0.25 vCPU instance. This value is only the
-# fallback used for a raw `-check`/local run of this file: start.sh rewrites
-# it at container startup from the DOH_MAX_INFLIGHT env var so the two never
-# drift apart at deploy time. Keep this literal in sync with the Go binary's
-# own `defaultMaxInflight` (main.go) and start.sh's fallback (64).
+# Fixed local concurrency ceiling for the resolver. The gateway's
+# DOH_MAX_INFLIGHT is hard-capped at the same 64, so the public layer cannot
+# admit more concurrent DNS work than the resolver is configured to handle.
 max_clients = 64
 
 ###############################################################################
