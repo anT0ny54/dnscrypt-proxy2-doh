@@ -100,7 +100,7 @@ reject_ttl = 10
 ###############################################################################
 
 cache = true
-cache_size = 1024
+cache_size = 4096
 cache_min_ttl = 60
 cache_max_ttl = 86400
 cache_neg_min_ttl = 60
