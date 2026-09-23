@@ -545,6 +545,7 @@ func main() {
 	maxBody := envInt("DOH_MAX_BODY", defaultMaxBody, 12, maxDNSPacket)
 	maxInflight := envInt("DOH_MAX_INFLIGHT", defaultMaxInflight, 1, maxMaxInflight)
 	maxConns := envInt("DOH_MAX_CONNS", defaultMaxConns, 1, maxMaxConns)
+	dohIdleTimeout := time.Duration(envInt("DOH_IDLE_TIMEOUT", 120, 1, 3600)) * time.Second
 	transport := dnsTransportLimitsFromEnv()
 	guardConfig, err := clientGuardConfigFromEnv()
 	if err != nil {
@@ -571,7 +572,7 @@ func main() {
 		ReadHeaderTimeout: httpReadTimeout,
 		ReadTimeout:       httpReadTimeout,
 		WriteTimeout:      httpWriteTimeout,
-		IdleTimeout:       15 * time.Second,
+		IdleTimeout:       dohIdleTimeout,
 		MaxHeaderBytes:    maxHeaderBytesFor(effMaxBody),
 	}
 
