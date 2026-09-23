@@ -9,8 +9,8 @@ dns_listen=127.0.0.1:5300
 port="${PORT:-8080}"
 doh_path="${DOH_PATH:-/dns-query}"
 doh_bind="${DOH_BIND:-0.0.0.0}"
-dnscrypt_gomemlimit="${DNSCRYPT_GOMEMLIMIT:-256MiB}"
-doh_gomemlimit="${DOH_GOMEMLIMIT:-64MiB}"
+dnscrypt_gomemlimit="${DNSCRYPT_GOMEMLIMIT:-288MiB}"
+doh_gomemlimit="${DOH_GOMEMLIMIT:-80MiB}"
 public_doh_url="${PUBLIC_DOH_URL:-}"
 doh_upstream="${DOH_UPSTREAM_ADDR:-$dns_listen}"
 
@@ -29,7 +29,7 @@ case "$doh_max_inflight" in
         ;;
     *)
         # Match the Go gateway's envInt() behavior: values below 1 fall back
-        # to 32, while values above the hard maximum are clamped to 64.
+        # to 64, while values above the hard maximum are clamped to 64.
         while [ "${doh_max_inflight#0}" != "$doh_max_inflight" ]; do
             doh_max_inflight=${doh_max_inflight#0}
         done
