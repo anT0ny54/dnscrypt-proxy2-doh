@@ -9,8 +9,8 @@ dns_listen=127.0.0.1:5300
 port="${PORT:-8080}"
 doh_path="${DOH_PATH:-/dns-query}"
 doh_bind="${DOH_BIND:-0.0.0.0}"
-dnscrypt_gomemlimit="${DNSCRYPT_GOMEMLIMIT:-192MiB}"
-doh_gomemlimit="${DOH_GOMEMLIMIT:-24MiB}"
+dnscrypt_gomemlimit="${DNSCRYPT_GOMEMLIMIT:-256MiB}"
+doh_gomemlimit="${DOH_GOMEMLIMIT:-64MiB}"
 public_doh_url="${PUBLIC_DOH_URL:-}"
 doh_upstream="${DOH_UPSTREAM_ADDR:-$dns_listen}"
 
@@ -20,12 +20,12 @@ doh_upstream="${DOH_UPSTREAM_ADDR:-$dns_listen}"
 # it will actually service, silently reintroducing backpressure at the
 # resolver even after DOH_MAX_INFLIGHT is raised. Rather than keep a second,
 # independent value hardcoded in the checked-in TOML, derive it here from
-# the same env var and the same fallback (32) the Go binary uses.
-doh_max_inflight="${DOH_MAX_INFLIGHT:-32}"
+# the same env var and the same fallback (64) the Go binary uses.
+doh_max_inflight="${DOH_MAX_INFLIGHT:-64}"
 case "$doh_max_inflight" in
     ''|*[!0-9]*)
-        echo "WARNING: DOH_MAX_INFLIGHT=\"$doh_max_inflight\" is invalid; using 32 for dnscrypt-proxy max_clients." >&2
-        doh_max_inflight=32
+        echo "WARNING: DOH_MAX_INFLIGHT=\"$doh_max_inflight\" is invalid; using 64 for dnscrypt-proxy max_clients." >&2
+        doh_max_inflight=64
         ;;
     *)
         # Match the Go gateway's envInt() behavior: values below 1 fall back
@@ -36,8 +36,8 @@ case "$doh_max_inflight" in
         [ -n "$doh_max_inflight" ] || doh_max_inflight=0
         case "$doh_max_inflight" in
             0)
-                echo "WARNING: DOH_MAX_INFLIGHT=\"${DOH_MAX_INFLIGHT:-}\" is below the minimum; using 32 for dnscrypt-proxy max_clients." >&2
-                doh_max_inflight=32
+                echo "WARNING: DOH_MAX_INFLIGHT=\"${DOH_MAX_INFLIGHT:-}\" is below the minimum; using 64 for dnscrypt-proxy max_clients." >&2
+                doh_max_inflight=64
                 ;;
             [1-9]|[1-5][0-9]|6[0-4])
                 ;;

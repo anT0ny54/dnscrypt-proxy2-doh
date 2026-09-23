@@ -51,21 +51,21 @@ The default limits are intentionally bounded for the small instance:
 
 | Setting | Default | Reason |
 |---|---:|---|
-| `max_clients` | `32` | Bounds dnscrypt-proxy work; `start.sh` synchronizes it to the effective `DOH_MAX_INFLIGHT` value. |
-| `DOH_MAX_INFLIGHT` | `32` | Keeps HTTP and DNS concurrency aligned; values below `1` fall back to `32` and values above `64` clamp to `64`. |
-| `DOH_MAX_CONNS` | `128` | Global active TCP-connection cap; excess connections are accepted then immediately closed. |
+| `max_clients` | `64` | Bounds dnscrypt-proxy work; `start.sh` synchronizes it to the effective `DOH_MAX_INFLIGHT` value. |
+| `DOH_MAX_INFLIGHT` | `64` | Keeps HTTP and DNS concurrency aligned; values below `1` fall back to `64` and values above `64` clamp to `64`. |
+| `DOH_MAX_CONNS` | `96` | Global active TCP-connection cap; excess connections are accepted then immediately closed. |
 | `DOH_RATE_RPS` | `10` | Per-source-IP DoH request token-bucket refill rate. |
-| `DOH_RATE_BURST` | `20` | Per-source-IP token-bucket burst capacity. |
-| `DOH_MAX_IP_CONNS` | `8` | Per-source-IP active TCP connection cap; excess connections are immediately closed. |
-| `DOH_MAX_IP_REQUESTS` | `8` | Per-source-IP concurrent DoH request cap. |
-| `DOH_MAX_CLIENT_STATES` | `1024` | Hard-bounded source-IP state entries across 16 shards. |
+| `DOH_RATE_BURST` | `24` | Per-source-IP token-bucket burst capacity. Sized to tolerate short browser DNS bursts. |
+| `DOH_MAX_IP_CONNS` | `12` | Per-source-IP active TCP connection cap; excess connections are immediately closed. |
+| `DOH_MAX_IP_REQUESTS` | `12` | Per-source-IP concurrent DoH request cap. |
+| `DOH_MAX_CLIENT_STATES` | `512` | Hard-bounded source-IP state entries across 16 shards; matches the MosDNS reference state cap. |
 | `DOH_MAX_UDP_PACKET` | `8192` | Resolver-leg UDP packet limit; oversized UDP responses are silently dropped. |
 | `DOH_MAX_TCP_FRAME` | `8192` | Resolver-leg DNS-over-TCP frame limit, checked before body allocation/parsing. |
-| `DOH_MAX_BODY` | `8192` | Public DoH request DNS-message limit; the effective value cannot exceed `DOH_MAX_TCP_FRAME`. |
-| `DNSCRYPT_GOMEMLIMIT` | `192MiB` | Leaves headroom for the rest of the 512 MiB container budget. |
-| `DOH_GOMEMLIMIT` | `24MiB` | Small gateway heap target; the gateway has no external Go dependencies. |
+| `DOH_MAX_BODY` | `4096` | Public DoH request DNS-message limit; aligned with the MosDNS `DOH_MAX_BODY_BYTES=4096` reference. The effective value cannot exceed `DOH_MAX_TCP_FRAME`. |
+| `DNSCRYPT_GOMEMLIMIT` | `256MiB` | Main resolver Go heap target, matching the MosDNS reference main-process target. |
+| `DOH_GOMEMLIMIT` | `64MiB` | Gateway Go heap target, matching the MosDNS reference DoH-proxy target. |
 | `GOMAXPROCS` | `1` | Avoids running two tiny Go services as if the host had many CPUs. |
-| DNS cache | `1024` entries | Useful cache reuse without turning the resolver into a large memory consumer. |
+| DNS cache | `4096` entries | Matches the MosDNS `CACHE_SIZE=4096` reference while remaining bounded for the 512 MiB instance. |
 | `cert_refresh_concurrency` | `2` | Keeps maintenance work low on 0.25 vCPU. |
 | upstream HTTP keepalive | `30s` | Favors connection reuse and reduces repeated TLS setup. |
 
@@ -75,7 +75,24 @@ The public DoH guard uses a sharded token bucket and bounded per-IP state. Rate/
 
 The 7-second HTTP write deadline deliberately exceeds the 5-second DNS budget because Go's `net/http` write deadline covers the whole request handling interval, not only the final socket write.
 
-The two `GOMEMLIMIT` values total 216 MiB, deliberately well under the 512 MiB container budget. `GOMEMLIMIT` is a soft heap target, not a hard cap, and it does not account for goroutine stacks, the Go runtime's own non-heap bookkeeping, the static binaries, or OS/container overhead. The remaining headroom (roughly 296 MiB) is available for those non-heap costs and traffic bursts.
+The two `GOMEMLIMIT` values total 320 MiB, leaving roughly 192 MiB of the 512 MiB container budget for non-heap runtime costs, static binaries, stacks, and traffic overhead. `GOMEMLIMIT` is a soft heap target, not a hard cap, and it does not account for goroutine stacks, the Go runtime's own non-heap bookkeeping, the static binaries, or OS/container overhead.
+
+### MosDNS-equivalent moderate profile
+
+For deployments that use this gateway beside a 512 MB / 0.25 vCPU MosDNS service, the key protection values are intentionally mapped as follows:
+
+| MosDNS reference | dnscrypt-proxy + DoH gateway equivalent |
+| :--- | :--- |
+| `DOH_RATE_LIMIT=10` | `DOH_RATE_RPS=10` |
+| `DOH_RATE_BURST=24` | `DOH_RATE_BURST=24` |
+| `IP_CONN_LIMIT=12` | `DOH_MAX_IP_CONNS=12` |
+| `GLOBAL_CONN_LIMIT=96` | `DOH_MAX_CONNS=96` |
+| `DOH_RATE_MAX_IPS=512` | `DOH_MAX_CLIENT_STATES=512` |
+| `CACHE_SIZE=4096` | `cache_size=4096` |
+| `GOMEMLIMIT=256MiB` | `DNSCRYPT_GOMEMLIMIT=256MiB` |
+| proxy `GOMEMLIMIT=64MiB` | `DOH_GOMEMLIMIT=64MiB` |
+
+There is no separate global request-rate bucket in this gateway. `DOH_MAX_INFLIGHT=64` is therefore used as the bounded global work ceiling, while `DOH_MAX_CONNS=96` provides the global connection cap. This is an equivalent resource-protection mapping, not a byte-for-byte copy of MosDNS's internal implementation.
 
 ## DoH behavior and hardening
 
@@ -116,20 +133,20 @@ Safe defaults are built into the image. Normally only `PORT` needs to match the 
 | `DOH_BIND` | `0.0.0.0` | Public gateway bind address. |
 | `DOH_PATH` | `/dns-query` | Public DoH path; `/`, `/healthz`, and `/readyz` are reserved. |
 | `DOH_UPSTREAM_ADDR` | `127.0.0.1:5300` | Where the gateway sends queries and probes `/readyz`. It does **not** move the dnscrypt-proxy listener, which is fixed at `127.0.0.1:5300` in `config/dnscrypt-proxy.toml`. Leave unchanged unless you deliberately point the gateway at a different resolver. |
-| `DOH_MAX_BODY` | `8192` | Public request DNS-message limit; effective cap is the lower of this value and `DOH_MAX_TCP_FRAME`. GET requests have additional HTTP-header overhead for Base64 expansion; the gateway sizes `MaxHeaderBytes` with headroom so over-limit GETs can still reach the handler and receive `413`. |
-| `DOH_MAX_INFLIGHT` | `32` | Hard-capped at `64`. |
-| `DOH_MAX_CONNS` | `128` | Hard-capped at `256`; excess accepted connections are immediately closed. |
+| `DOH_MAX_BODY` | `4096` | Public request DNS-message limit; effective cap is the lower of this value and `DOH_MAX_TCP_FRAME`. |
+| `DOH_MAX_INFLIGHT` | `64` | Hard-capped at `64`. |
+| `DOH_MAX_CONNS` | `96` | Hard-capped at `256`; excess accepted connections are immediately closed. |
 | `DOH_RATE_RPS` | `10` | Per-source-IP token-bucket refill rate; hard-capped at `100`. |
-| `DOH_RATE_BURST` | `20` | Per-source-IP burst; hard-capped at `256`. |
-| `DOH_MAX_IP_CONNS` | `8` | Per-source-IP active connection cap; hard-capped at `32`. |
-| `DOH_MAX_IP_REQUESTS` | `8` | Per-source-IP concurrent request cap; hard-capped at `32`. |
-| `DOH_MAX_CLIENT_STATES` | `1024` | Bounded to `16`-`2048`, rounded to the 16 guard shards. |
+| `DOH_RATE_BURST` | `24` | Per-source-IP burst; hard-capped at `256`. |
+| `DOH_MAX_IP_CONNS` | `12` | Per-source-IP active connection cap; hard-capped at `32`. |
+| `DOH_MAX_IP_REQUESTS` | `12` | Per-source-IP concurrent request cap; hard-capped at `32`. |
+| `DOH_MAX_CLIENT_STATES` | `512` | Bounded to `16`-`2048`, rounded to the 16 guard shards. |
 | `DOH_MAX_UDP_PACKET` | `8192` | Resolver-leg UDP packet limit; hard-capped at `65535`. |
 | `DOH_MAX_TCP_FRAME` | `8192` | Resolver-leg TCP DNS frame limit; hard-capped at `65535`. |
 | `DOH_TRUSTED_PROXY_CIDRS` | unset | Comma-separated trusted proxy prefixes; only then is `X-Forwarded-For` used. |
 | `GOMAXPROCS` | `1` | Recommended value for 0.25 vCPU. |
-| `DNSCRYPT_GOMEMLIMIT` | `192MiB` | dnscrypt-proxy Go heap target. |
-| `DOH_GOMEMLIMIT` | `24MiB` | gateway Go heap target. |
+| `DNSCRYPT_GOMEMLIMIT` | `256MiB` | Main dnscrypt-proxy Go heap target. |
+| `DOH_GOMEMLIMIT` | `64MiB` | DoH gateway Go heap target. |
 | `PUBLIC_DOH_URL` | unset | Optional startup log only; does not change routing. |
 
 `DNS_LISTEN` and `SERVER_NAMES` are intentionally not runtime settings. The internal listener and resolver set remain fixed so deployment variables cannot accidentally change the topology or upstream policy. The TCP DNS fallback is intentionally one-shot: each connection handles exactly one query before closing.
