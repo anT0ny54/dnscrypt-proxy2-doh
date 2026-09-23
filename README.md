@@ -27,7 +27,7 @@ Only the HTTP DoH gateway is intended to be public. The resolver listener is loo
 
 - **dnscrypt-proxy 2.1.18** — latest formal upstream GitHub release verified on 2026-09-23.
 - **Go 1.27.1** — current Go 1.27 patch release used by the builder.
-- **Alpine 3.24** — builder and runtime base branch.
+- **Alpine 3.24.2** — current patched 3.24 release used by the builder and runtime.
 
 Upstream's `master` changelog contains a **2.1.19** section, but the formal GitHub release index still lists **2.1.18** as the latest release. This deployment therefore remains pinned to the tagged 2.1.18 release rather than an unreleased branch.
 
@@ -51,7 +51,7 @@ The default limits are intentionally bounded for the small instance:
 
 | Setting | Default | Reason |
 |---|---:|---|
-| `max_clients` | `64` | Bounds dnscrypt-proxy work; `start.sh` synchronizes it to the effective `DOH_MAX_INFLIGHT` value. |
+| `max_clients` | `64` | Fixed resolver-side concurrency ceiling; the gateway's `DOH_MAX_INFLIGHT` is hard-capped at the same value. |
 | `DOH_MAX_INFLIGHT` | `64` | Keeps HTTP and DNS concurrency aligned; values below `1` fall back to `64` and values above `64` clamp to `64`. |
 | `DOH_MAX_CONNS` | `96` | Global active TCP-connection cap; excess connections are accepted then immediately closed. |
 | `DOH_RATE_RPS` | `100/60s` (1.6667/s) | Per-client-IP + Host sustained token-bucket refill rate. |
@@ -69,7 +69,7 @@ The default limits are intentionally bounded for the small instance:
 | `cert_refresh_concurrency` | `2` | Keeps maintenance work low on 0.25 vCPU. |
 | upstream HTTP keepalive | `30s` | Favors connection reuse and reduces repeated TLS setup. |
 
-The gateway sizes request headers for the worst supported Base64 GET representation, including percent-escaped standard Base64, rather than capping them at the DNS-message limit. It uses a **5-second** read timeout, a **7-second** write timeout, and a **15-second** idle timeout. Each DNS exchange gets one combined **5-second** budget, including a possible UDP-to-TCP retry.
+The gateway sizes request headers for the worst supported Base64 GET representation, including percent-escaped standard Base64, rather than capping them at the DNS-message limit. It uses a **5-second** read timeout, a **7-second** write timeout, and a **120-second** idle timeout. Each DNS exchange gets one combined **5-second** budget, including a possible UDP-to-TCP retry.
 
 The public DoH guard uses a sharded token bucket keyed by client IP + canonical Host and bounded client state. Multiple browsers/devices behind the same public IP share the same Host-specific bucket; different Host values on that IP get independent request budgets. The default sustained rate is 100 requests per 60 seconds per IP + Host, with an 80-request startup burst so short browser DNS bursts do not immediately throttle. Rate/concurrency rejection happens before base64/DNS parsing, while transport-level overflow is handled separately: oversized UDP datagrams are silently discarded and oversized TCP DNS frames are rejected immediately after the two-byte length prefix, before body allocation. The current TCP fallback opens one connection per DNS exchange, so the maximum queries per TCP connection is fixed at **1**.
 
@@ -169,7 +169,7 @@ The Docker `HEALTHCHECK` uses `/readyz`.
 
 ## Shutdown and supervision
 
-`start.sh` is the container entrypoint (PID 1) and supervises both processes. If either one exits unexpectedly, the container exits with status `1` and an `ERROR:` line in the log. On `SIGTERM`/`SIGINT`/`SIGHUP` it stops the gateway first (so in-flight DoH requests can finish), then dnscrypt-proxy, escalating to `SIGKILL` if a child does not exit in time (gateway 7.5 s, dnscrypt-proxy 2 s), and exits with status `0`.
+`start.sh` is the container entrypoint (PID 1) and supervises both processes. The checked-in dnscrypt-proxy configuration is validated but never rewritten at runtime. If either one exits unexpectedly, the container exits with status `1` and an `ERROR:` line in the log. On `SIGTERM`/`SIGINT`/`SIGHUP` it stops the gateway first (so in-flight DoH requests can finish), then dnscrypt-proxy, escalating to `SIGKILL` if a child does not exit in time (gateway 7.5 s, dnscrypt-proxy 2 s), and exits with status `0`.
 
 ## Local Docker test
 
@@ -224,6 +224,13 @@ Do not build directly from an unreleased upstream `master` commit for the produc
 - dnscrypt-proxy: https://github.com/DNSCrypt/dnscrypt-proxy
 - Public resolver list: https://github.com/DNSCrypt/dnscrypt-resolvers/tree/master/v3
 - HaGeZi DNS: https://github.com/hagezi/dns-servers
+
+
+## Validation
+
+The checked-in configuration was re-validated on **2026-09-24**. The startup script contains no runtime configuration rewrite, `max_clients` remains fixed at `64`, and the gateway hard-caps `DOH_MAX_INFLIGHT` at `64`. The Docker builder and runtime both use Alpine `3.24.2`, and the gateway idle timeout is `120s` by default. The three checked-in HaGeZi Full Protection DoH stamps match the current upstream server table; no stamp changes were required.
+
+The DoH gateway test suite passes with `go test ./...`, `go test -race ./...`, and `go build ./...` in a temporary compatibility copy using the available Go `1.23.2` toolchain (the copy's module directive was lowered only for this validation). A native Go `1.27.1` run could not be executed because that toolchain is not installed here and outbound toolchain download is unavailable; Docker is likewise unavailable.
 
 ## License
 

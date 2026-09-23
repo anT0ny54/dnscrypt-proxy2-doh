@@ -14,44 +14,13 @@ doh_gomemlimit="${DOH_GOMEMLIMIT:-80MiB}"
 public_doh_url="${PUBLIC_DOH_URL:-}"
 doh_upstream="${DOH_UPSTREAM_ADDR:-$dns_listen}"
 
-# dnscrypt-proxy's max_clients is the resolver's own client concurrency
-# ceiling; it must not sit below the DoH gateway's own DOH_MAX_INFLIGHT or
-# the gateway can admit more concurrent exchanges than the resolver behind
-# it will actually service, silently reintroducing backpressure at the
-# resolver even after DOH_MAX_INFLIGHT is raised. Rather than keep a second,
-# independent value hardcoded in the checked-in TOML, derive it here from
-# the same env var and the same fallback (64) the Go binary uses.
-doh_max_inflight="${DOH_MAX_INFLIGHT:-64}"
-case "$doh_max_inflight" in
-    ''|*[!0-9]*)
-        echo "WARNING: DOH_MAX_INFLIGHT=\"$doh_max_inflight\" is invalid; using 64 for dnscrypt-proxy max_clients." >&2
-        doh_max_inflight=64
-        ;;
-    *)
-        # Match the Go gateway's envInt() behavior: values below 1 fall back
-        # to 64, while values above the hard maximum are clamped to 64.
-        while [ "${doh_max_inflight#0}" != "$doh_max_inflight" ]; do
-            doh_max_inflight=${doh_max_inflight#0}
-        done
-        [ -n "$doh_max_inflight" ] || doh_max_inflight=0
-        case "$doh_max_inflight" in
-            0)
-                echo "WARNING: DOH_MAX_INFLIGHT=\"${DOH_MAX_INFLIGHT:-}\" is below the minimum; using 64 for dnscrypt-proxy max_clients." >&2
-                doh_max_inflight=64
-                ;;
-            [1-9]|[1-5][0-9]|6[0-4])
-                ;;
-            *)
-                echo "WARNING: DOH_MAX_INFLIGHT=\"${DOH_MAX_INFLIGHT:-}\" exceeds the maximum; using 64 for dnscrypt-proxy max_clients." >&2
-                doh_max_inflight=64
-                ;;
-        esac
-        ;;
-esac
-sed -i "s/^max_clients = .*/max_clients = ${doh_max_inflight}/" "$CONFIG_FILE"
+# dnscrypt-proxy's max_clients is fixed at 64 in the checked-in config.
+# The gateway's DOH_MAX_INFLIGHT is hard-capped at the same 64, so the
+# resolver always has at least as much local concurrency available as the
+# gateway can admit. Keeping the config immutable avoids rewriting a file in
+# the image at startup and keeps the unprivileged container filesystem safe.
 
-# Validate the checked-in configuration (with max_clients now synced to
-# DOH_MAX_INFLIGHT above) before starting either service.
+# Validate the immutable checked-in configuration before starting either service.
 echo "Checking dnscrypt-proxy configuration..."
 if ! "$DNSCRYPT_BIN" -config "$CONFIG_FILE" -check; then
     echo "ERROR: dnscrypt-proxy configuration check failed." >&2
@@ -59,7 +28,7 @@ if ! "$DNSCRYPT_BIN" -config "$CONFIG_FILE" -check; then
 fi
 
 echo "Starting dnscrypt-proxy 2 + DoH gateway"
-echo "  dnscrypt-proxy : $dns_listen (max_clients=$doh_max_inflight, synced to DOH_MAX_INFLIGHT)"
+echo "  dnscrypt-proxy : $dns_listen (max_clients=64; gateway DOH_MAX_INFLIGHT is capped at 64)"
 echo "  resolvers      : HaGeZiDNS1, HaGeZiDNS2, HaGeZiDNS3 (static)"
 echo "  DoH endpoint   : ${doh_bind}:$port$doh_path"
 echo "  memory target  : ${dnscrypt_gomemlimit} dnscrypt-proxy + ${doh_gomemlimit} doh-gateway"
