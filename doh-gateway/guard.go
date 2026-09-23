@@ -17,10 +17,10 @@ import (
 
 const (
 	defaultDoHRPS          = 10.0
-	defaultDoHBurst        = 20
-	defaultDoHIPConns      = 8
-	defaultDoHIPRequests   = 8
-	defaultDoHClientStates = 1024
+	defaultDoHBurst        = 24
+	defaultDoHIPConns      = 12
+	defaultDoHIPRequests   = 12
+	defaultDoHClientStates = 512
 	defaultDoHStateTTL     = 5 * time.Minute
 	defaultMaxUDPPacket    = 8 << 10
 	defaultMaxTCPFrame     = 8 << 10

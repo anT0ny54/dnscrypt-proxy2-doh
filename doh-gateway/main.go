@@ -33,9 +33,9 @@ const (
 	httpWriteTimeout = 7 * time.Second
 	httpReadTimeout  = 5 * time.Second
 
-	defaultMaxBody     = 8 << 10 // 8 KiB request query limit
-	defaultMaxInflight = 32
-	defaultMaxConns    = 128
+	defaultMaxBody     = 4 << 10 // 4 KiB request query limit
+	defaultMaxInflight = 64
+	defaultMaxConns    = 96
 	maxMaxInflight     = 64
 	maxMaxConns        = 256
 
