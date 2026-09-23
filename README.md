@@ -25,11 +25,11 @@ Only the HTTP DoH gateway is intended to be public. The resolver listener is loo
 
 ## Versions verified for this build
 
-- **dnscrypt-proxy 2.1.18** — latest formal upstream GitHub release as of 2026-09-18.
+- **dnscrypt-proxy 2.1.18** — latest formal upstream GitHub release verified on 2026-09-23.
 - **Go 1.27.1** — current Go 1.27 patch release used by the builder.
-- **Alpine 3.24** — the builder and runtime both use the same pinned Alpine 3.24 release branch, so patch updates stay aligned.
+- **Alpine 3.24** — builder and runtime base branch.
 
-Upstream's `master` changelog already contains a **2.1.19** section, but it is not shown as a formal release in the upstream release index. This deployment therefore stays on the tagged 2.1.18 release rather than building from an unreleased branch.
+Upstream's `master` changelog contains a **2.1.19** section, but the formal GitHub release index still lists **2.1.18** as the latest release. This deployment therefore remains pinned to the tagged 2.1.18 release rather than an unreleased branch.
 
 ## Upstream resolvers
 
@@ -51,8 +51,8 @@ The default limits are intentionally bounded for the small instance:
 
 | Setting | Default | Reason |
 |---|---:|---|
-| `max_clients` | `32` | Bounds dnscrypt-proxy work. |
-| `DOH_MAX_INFLIGHT` | `32` | Keeps HTTP and DNS concurrency aligned. |
+| `max_clients` | `32` | Bounds dnscrypt-proxy work; `start.sh` synchronizes it to the effective `DOH_MAX_INFLIGHT` value. |
+| `DOH_MAX_INFLIGHT` | `32` | Keeps HTTP and DNS concurrency aligned; values below `1` fall back to `32` and values above `64` clamp to `64`. |
 | `DOH_MAX_CONNS` | `128` | Global active TCP-connection cap; excess connections are accepted then immediately closed. |
 | `DOH_RATE_RPS` | `10` | Per-source-IP DoH request token-bucket refill rate. |
 | `DOH_RATE_BURST` | `20` | Per-source-IP token-bucket burst capacity. |
@@ -67,15 +67,15 @@ The default limits are intentionally bounded for the small instance:
 | `GOMAXPROCS` | `1` | Avoids running two tiny Go services as if the host had many CPUs. |
 | DNS cache | `1024` entries | Useful cache reuse without turning the resolver into a large memory consumer. |
 | `cert_refresh_concurrency` | `2` | Keeps maintenance work low on 0.25 vCPU. |
-| upstream HTTP keepalive | `30s` | Favors connection reuse and avoids repeated TLS setup. |
+| upstream HTTP keepalive | `30s` | Favors connection reuse and reduces repeated TLS setup. |
 
-The gateway sizes request headers with Base64 GET headroom instead of capping them at the DNS-message limit, uses a **5-second** read timeout, a **7-second** write timeout, and a **15-second** idle timeout. Each DNS exchange gets one combined **5-second** budget, including a possible UDP-to-TCP retry.
+The gateway sizes request headers for the worst supported Base64 GET representation, including percent-escaped standard Base64, rather than capping them at the DNS-message limit. It uses a **5-second** read timeout, a **7-second** write timeout, and a **15-second** idle timeout. Each DNS exchange gets one combined **5-second** budget, including a possible UDP-to-TCP retry.
 
 The public DoH guard uses a sharded token bucket and bounded per-IP state. Rate/concurrency rejection happens before base64/DNS parsing, while transport-level overflow is handled separately: oversized UDP datagrams are silently discarded and oversized TCP DNS frames are rejected immediately after the two-byte length prefix, before body allocation. The current TCP fallback opens one connection per DNS exchange, so the maximum queries per TCP connection is fixed at **1**.
 
 The 7-second HTTP write deadline deliberately exceeds the 5-second DNS budget because Go's `net/http` write deadline covers the whole request handling interval, not only the final socket write.
 
-The two `GOMEMLIMIT` values total 216 MiB, deliberately well under the 512 MiB container budget. `GOMEMLIMIT` is a soft heap target, not a hard cap, and it doesn't account for goroutine stacks, the Go runtime's own non-heap bookkeeping, the static binaries, or OS/container overhead. The remaining headroom (roughly 296 MiB) absorbs that non-heap overhead plus traffic bursts, rather than being unused capacity.
+The two `GOMEMLIMIT` values total 216 MiB, deliberately well under the 512 MiB container budget. `GOMEMLIMIT` is a soft heap target, not a hard cap, and it does not account for goroutine stacks, the Go runtime's own non-heap bookkeeping, the static binaries, or OS/container overhead. The remaining headroom (roughly 296 MiB) is available for those non-heap costs and traffic bursts.
 
 ## DoH behavior and hardening
 
@@ -176,12 +176,7 @@ Use a DoH-capable client for `/dns-query`; opening that URL directly in a browse
 
 ```text
 .
-├── .github/
-│   └── workflows/
-│       └── Keep-Alive.yml
 ├── Dockerfile
-├── .dockerignore
-├── .gitignore
 ├── CHANGELOG.md
 ├── LICENSE
 ├── README.md
@@ -194,8 +189,6 @@ Use a DoH-capable client for `/dns-query`; opening that URL directly in a browse
     ├── main.go
     └── main_test.go
 ```
-
-`.github/workflows/Keep-Alive.yml` commits a timestamp to `keep-alive.txt` on the 1st and 15th of each month so the fork stays active for GitHub Actions. It only touches the repository; it does not keep the deployed instance awake. If your platform auto-deploys on every push, those commits can trigger a redeploy.
 
 ## Updating
 

@@ -24,8 +24,28 @@ doh_upstream="${DOH_UPSTREAM_ADDR:-$dns_listen}"
 doh_max_inflight="${DOH_MAX_INFLIGHT:-32}"
 case "$doh_max_inflight" in
     ''|*[!0-9]*)
-        echo "WARNING: DOH_MAX_INFLIGHT=\"$doh_max_inflight\" is not a positive integer; using 32 for dnscrypt-proxy max_clients." >&2
+        echo "WARNING: DOH_MAX_INFLIGHT=\"$doh_max_inflight\" is invalid; using 32 for dnscrypt-proxy max_clients." >&2
         doh_max_inflight=32
+        ;;
+    *)
+        # Match the Go gateway's envInt() behavior: values below 1 fall back
+        # to 32, while values above the hard maximum are clamped to 64.
+        while [ "${doh_max_inflight#0}" != "$doh_max_inflight" ]; do
+            doh_max_inflight=${doh_max_inflight#0}
+        done
+        [ -n "$doh_max_inflight" ] || doh_max_inflight=0
+        case "$doh_max_inflight" in
+            0)
+                echo "WARNING: DOH_MAX_INFLIGHT=\"${DOH_MAX_INFLIGHT:-}\" is below the minimum; using 32 for dnscrypt-proxy max_clients." >&2
+                doh_max_inflight=32
+                ;;
+            [1-9]|[1-5][0-9]|6[0-4])
+                ;;
+            *)
+                echo "WARNING: DOH_MAX_INFLIGHT=\"${DOH_MAX_INFLIGHT:-}\" exceeds the maximum; using 64 for dnscrypt-proxy max_clients." >&2
+                doh_max_inflight=64
+                ;;
+        esac
         ;;
 esac
 sed -i "s/^max_clients = .*/max_clients = ${doh_max_inflight}/" "$CONFIG_FILE"
@@ -54,7 +74,7 @@ dns_pid=0
 doh_pid=0
 cleanup_done=0
 
-# stop_child PID TENTHS
+# stop_child PID TICKS
 # Send SIGTERM, wait up to TENTHS x 0.1s for a clean exit, then SIGKILL and
 # reap. A no-op when PID is 0 (never started) or already gone. The short poll
 # interval matters: an exited-but-unreaped child still answers `kill -0`, so
