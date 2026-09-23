@@ -56,13 +56,13 @@ var (
 	indexBody             = []byte("dnscrypt-proxy DoH gateway\nPOST or GET /dns-query with a DNS message\n")
 )
 
-// maxHeaderBytesFor sizes net/http's MaxHeaderBytes with headroom for a GET
-// request's base64url-encoded query string on top of maxBody. Base64 inflates
-// data by 4/3; without this headroom a GET query sized close to maxBody would
-// be rejected at the header-parsing layer (e.g. 431) instead of reaching the
-// handler's client-friendly 413 response.
+// maxHeaderBytesFor sizes net/http's MaxHeaderBytes for the worst supported
+// GET representation. Base64 expands the DNS message by 4/3, and a client can
+// percent-escape every Base64 character, expanding those bytes by another 3x.
+// This keeps an oversized GET inside header parsing far enough to reach the
+// handler's client-friendly 413 response instead of being rejected as 431.
 func maxHeaderBytesFor(maxBody int) int {
-	return (maxBody*4+2)/3 + headerOverhead
+	return maxBody*4 + headerOverhead
 }
 
 func env(key, fallback string) string {
@@ -72,21 +72,37 @@ func env(key, fallback string) string {
 	return fallback
 }
 
-// envInt and envFloat are the single shared implementation for "read env var,
-// trim, parse, clamp to [min,max], fall back to a default on any parse
-// error" used throughout this package (by both the HTTP server setup here
-// and the client-guard/transport configuration in guard.go).
+// envInt parses the same unsigned-decimal syntax used by start.sh:
+// non-empty ASCII digits only, no trimming or leading '+'. Values below min
+// fall back to the default, while values above max (including integer
+// overflow) clamp to max.
 func envInt(key string, fallback, min, max int) int {
-	v := strings.TrimSpace(os.Getenv(key))
+	v := os.Getenv(key)
 	if v == "" {
 		return fallback
 	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n < min {
-		return fallback
+
+	n := 0
+	overflow := false
+	for i := 0; i < len(v); i++ {
+		if v[i] < '0' || v[i] > '9' {
+			return fallback
+		}
+		digit := int(v[i] - '0')
+		if !overflow {
+			if n > (max-digit)/10 {
+				overflow = true
+			} else {
+				n = n*10 + digit
+			}
+		}
 	}
-	if n > max {
+
+	if overflow || n > max {
 		return max
+	}
+	if n < min {
+		return fallback
 	}
 	return n
 }
@@ -231,6 +247,10 @@ var udpBufPool = sync.Pool{
 }
 
 func dnsExchangeUDP(ctx context.Context, addr string, q []byte, maxUDPPacket int) ([]byte, error) {
+	if len(q) == 0 || len(q) > maxUDPPacket {
+		return nil, errors.New("DNS query exceeds UDP packet limit")
+	}
+
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "udp", addr)
 	if err != nil {
@@ -239,10 +259,6 @@ func dnsExchangeUDP(ctx context.Context, addr string, q []byte, maxUDPPacket int
 	defer conn.Close()
 	defer watchCancel(ctx, conn)()
 	setConnDeadline(ctx, conn)
-
-	if len(q) == 0 || len(q) > maxUDPPacket {
-		return nil, errors.New("DNS query exceeds UDP packet limit")
-	}
 	if _, err := conn.Write(q); err != nil {
 		return nil, err
 	}
@@ -337,7 +353,13 @@ func upstreamReady(addr string) bool {
 	return true
 }
 
+// writeText writes a plain-text status response. Content-Type is set here,
+// before WriteHeader, because every call site is an error/status path with
+// no other opportunity to set it: once WriteHeader runs, net/http's
+// automatic Content-Type sniffing (which only applies if no Content-Type
+// was set before the first Write) no longer has a chance to add one.
 func writeText(w http.ResponseWriter, status int, body string) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(status)
 	_, _ = io.WriteString(w, body)
 }

@@ -230,6 +230,14 @@ func TestGuardedTCPDNSConnEnforcesQueryCountAndFrameSize(t *testing.T) {
 	}
 }
 
+func TestDNSExchangeUDPRejectsOversizedQueryBeforeDial(t *testing.T) {
+	query := make([]byte, 129)
+	_, err := dnsExchangeUDP(context.Background(), "not-a-valid-udp-address", query, 128)
+	if err == nil || !strings.Contains(err.Error(), "UDP packet limit") {
+		t.Fatalf("dnsExchangeUDP() error = %v, want UDP packet limit validation before dial", err)
+	}
+}
+
 func TestDNSExchangeUDPDropsOversizedDatagram(t *testing.T) {
 	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
 	if err != nil {
@@ -454,6 +462,35 @@ func TestDoHServerGetOverMaxBodyReachesHandler(t *testing.T) {
 
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("GET over maxBody through net/http status = %d, want %d", resp.StatusCode, http.StatusRequestEntityTooLarge)
+	}
+}
+
+func TestDoHServerGetPercentEscapedStandardBase64OverMaxBodyReachesHandler(t *testing.T) {
+	const maxBody = 8 << 10
+
+	h := dohHandlerWithGuard("127.0.0.1:1", "/dns-query", maxBody, 1, defaultDNSTransportLimits(), nil, nil)
+	srv := httptest.NewUnstartedServer(h)
+	srv.Config.MaxHeaderBytes = maxHeaderBytesFor(maxBody)
+	srv.Start()
+	defer srv.Close()
+
+	// 0xff bytes encode entirely as '/' in standard Base64, making the
+	// percent-escaped representation close to the worst supported GET size.
+	query := bytes.Repeat([]byte{0xff}, maxBody+1)
+	encoded := base64.StdEncoding.EncodeToString(query)
+	escaped := strings.ReplaceAll(encoded, "/", "%2F")
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/dns-query?dns="+escaped, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("percent-escaped standard Base64 GET over maxBody status = %d, want %d", resp.StatusCode, http.StatusRequestEntityTooLarge)
 	}
 }
 

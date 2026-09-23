@@ -373,16 +373,7 @@ func remoteAddrIP(addr net.Addr) netip.Addr {
 	if addr == nil {
 		return netip.IPv4Unspecified()
 	}
-	text := strings.TrimSpace(addr.String())
-	if host, _, err := net.SplitHostPort(text); err == nil {
-		if ip, err := netip.ParseAddr(host); err == nil {
-			return ip.Unmap()
-		}
-	}
-	if ip, err := netip.ParseAddr(text); err == nil {
-		return ip.Unmap()
-	}
-	return netip.IPv4Unspecified()
+	return remoteAddrIPString(addr.String())
 }
 
 func trustedProxyContains(prefixes []netip.Prefix, ip netip.Addr) bool {
