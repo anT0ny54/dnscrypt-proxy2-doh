@@ -33,11 +33,12 @@ const (
 	httpWriteTimeout = 7 * time.Second
 	httpReadTimeout  = 5 * time.Second
 
-	defaultMaxBody     = 4 << 10 // 4 KiB request query limit
-	defaultMaxInflight = 64
-	defaultMaxConns    = 96
-	maxMaxInflight     = 64
-	maxMaxConns        = 256
+	defaultMaxBody        = 4 << 10 // 4 KiB request query limit
+	defaultMaxInflight    = 64
+	defaultMaxConns       = 96
+	maxMaxInflight        = 64
+	maxMaxConns           = 256
+	defaultDoHIdleTimeout = 120 * time.Second
 
 	// headerOverhead budgets for the request line/method/host and the fixed
 	// set of headers the handler reads (Content-Type, Accept, etc.), on top
@@ -237,8 +238,8 @@ func setConnDeadline(ctx context.Context, conn net.Conn) {
 // udpBufPool recycles the receive buffer for UDP responses. It stays at the DNS
 // wire maximum so the guard can distinguish normal packets from oversized
 // datagrams without allocating a second buffer on the hot path. Without the
-// pool every request allocates 64 KiB, which is heavy GC churn under the
-// gateway's small (24 MiB) heap target.
+// pool every request allocates 64 KiB, which is avoidable GC churn under the
+// gateway's small 80 MiB heap target.
 var udpBufPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, maxDNSPacket)
@@ -546,7 +547,8 @@ func main() {
 	maxBody := envInt("DOH_MAX_BODY", defaultMaxBody, 12, maxDNSPacket)
 	maxInflight := envInt("DOH_MAX_INFLIGHT", defaultMaxInflight, 1, maxMaxInflight)
 	maxConns := envInt("DOH_MAX_CONNS", defaultMaxConns, 1, maxMaxConns)
-	dohIdleTimeout := time.Duration(envInt("DOH_IDLE_TIMEOUT", 120, 1, 3600)) * time.Second
+	dohIdleTimeoutSeconds := envInt("DOH_IDLE_TIMEOUT", int(defaultDoHIdleTimeout/time.Second), 1, 3600)
+	dohIdleTimeout := time.Duration(dohIdleTimeoutSeconds) * time.Second
 	transport := dnsTransportLimitsFromEnv()
 	guardConfig, err := clientGuardConfigFromEnv()
 	if err != nil {

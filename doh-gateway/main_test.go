@@ -46,6 +46,23 @@ func TestValidateDNSQuery(t *testing.T) {
 	}
 }
 
+func TestDoHConcurrencyAndTimeoutDefaultsStayCapped(t *testing.T) {
+	transport := defaultDNSTransportLimits()
+
+	if _, got, _ := effectiveDoHLimits(maxDNSPacket, 100, transport); got != maxMaxInflight {
+		t.Fatalf("DOH_MAX_INFLIGHT above cap normalized to %d, want %d", got, maxMaxInflight)
+	}
+	if _, got, _ := effectiveDoHLimits(maxDNSPacket, 0, transport); got != defaultMaxInflight {
+		t.Fatalf("DOH_MAX_INFLIGHT below minimum normalized to %d, want %d", got, defaultMaxInflight)
+	}
+	if maxMaxInflight != 64 || defaultMaxInflight != 64 {
+		t.Fatalf("DoH inflight cap/default changed: cap=%d default=%d, want 64/64", maxMaxInflight, defaultMaxInflight)
+	}
+	if defaultDoHIdleTimeout != 120*time.Second {
+		t.Fatalf("default DoH idle timeout = %s, want 120s", defaultDoHIdleTimeout)
+	}
+}
+
 func TestTunedDefaults(t *testing.T) {
 	for _, key := range []string{
 		"DOH_RATE_RPS",
