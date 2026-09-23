@@ -23,7 +23,7 @@ listen_addresses = ['127.0.0.1:5300']
 # fallback used for a raw `-check`/local run of this file: start.sh rewrites
 # it at container startup from the DOH_MAX_INFLIGHT env var so the two never
 # drift apart at deploy time. Keep this literal in sync with the Go binary's
-# own `defaultMaxInflight` (main.go) and start.sh's fallback.
+# own `defaultMaxInflight` (main.go) and start.sh's fallback (64).
 max_clients = 64
 
 ###############################################################################
@@ -100,7 +100,7 @@ reject_ttl = 10
 ###############################################################################
 
 cache = true
-cache_size = 4096
+cache_size = 8192
 cache_min_ttl = 60
 cache_max_ttl = 86400
 cache_neg_min_ttl = 60
