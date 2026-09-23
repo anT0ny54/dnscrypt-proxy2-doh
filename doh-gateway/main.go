@@ -442,12 +442,13 @@ func dohHandlerWithGuard(upstream, path string, maxBody, maxInflight int, transp
 		var sourceIP netip.Addr
 		if guard != nil {
 			sourceIP = requestClientIP(r, trustedProxies)
-			if !guard.beginRequest(sourceIP, time.Now()) {
+			rateKey := clientHostKey(sourceIP, r.Host)
+			if !guard.beginRequest(rateKey, time.Now()) {
 				w.Header().Set("Retry-After", "1")
 				writeText(w, http.StatusTooManyRequests, "client rate/concurrency limit exceeded\n")
 				return
 			}
-			defer guard.endRequest(sourceIP, time.Now())
+			defer guard.endRequest(rateKey, time.Now())
 		}
 
 		if r.Method != http.MethodGet && r.Method != http.MethodPost {
@@ -585,7 +586,7 @@ func main() {
 	log.Printf("DoH gateway listening on http://%s%s -> %s", addr, path, upstream)
 	log.Printf("health endpoints: http://%s/healthz and /readyz", net.JoinHostPort(bindHost, port))
 	log.Printf("limits: max %d in-flight exchanges, max %d TCP connections, max %d-byte DoH query", effMaxInflight, maxConns, effMaxBody)
-	log.Printf("abuse guard: %.1f rps / burst %d, max %d conns + %d requests per source IP, max %d client states", guardConfig.rps, guardConfig.burst, guardConfig.maxIPConns, guardConfig.maxIPRequests, guardConfig.maxClientStates)
+	log.Printf("abuse guard: %.3f rps (100/60s) / burst %d, max %d conns + %d concurrent requests per client IP, rate bucket key=IP+Host, max %d client states", guardConfig.rps, guardConfig.burst, guardConfig.maxIPConns, guardConfig.maxIPRequests, guardConfig.maxClientStates)
 	log.Printf("DNS transport guard: UDP %d bytes, TCP frame %d bytes, max %d TCP queries/connection", effTransport.maxUDPPacket, effTransport.maxTCPFrame, effTransport.maxTCPQueries)
 
 	serveErr := make(chan error, 1)

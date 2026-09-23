@@ -16,11 +16,11 @@ import (
 )
 
 const (
-	defaultDoHRPS          = 10.0
-	defaultDoHBurst        = 24
-	defaultDoHIPConns      = 12
-	defaultDoHIPRequests   = 12
-	defaultDoHClientStates = 512
+	defaultDoHRPS          = 100.0 / 60.0 // 100 requests per 60 seconds sustained
+	defaultDoHBurst        = 80
+	defaultDoHIPConns      = 32
+	defaultDoHIPRequests   = 64
+	defaultDoHClientStates = 4096
 	defaultDoHStateTTL     = 5 * time.Minute
 	defaultMaxUDPPacket    = 8 << 10
 	defaultMaxTCPFrame     = 8 << 10
@@ -28,8 +28,8 @@ const (
 	maxDoHRPS              = 100.0
 	maxDoHBurst            = 256
 	maxDoHIPConns          = 32
-	maxDoHIPRequests       = 32
-	maxDoHClientStates     = 2048
+	maxDoHIPRequests       = 64
+	maxDoHClientStates     = 8192
 	minDoHClientStates     = 16
 	maxDoHTransportSize    = maxDNSPacket
 	clientGuardShardCount  = 16
@@ -117,6 +117,11 @@ func parseTrustedProxyCIDRs(value string) ([]netip.Prefix, error) {
 	return prefixes, nil
 }
 
+type clientKey struct {
+	ip   netip.Addr
+	host string
+}
+
 type clientState struct {
 	tokens     float64
 	lastRefill time.Time
@@ -127,7 +132,7 @@ type clientState struct {
 
 type clientShard struct {
 	mu    sync.Mutex
-	items map[netip.Addr]*clientState
+	items map[clientKey]*clientState
 }
 
 // clientGuard uses fixed-size shards and a hard per-shard entry cap. This keeps
@@ -146,50 +151,79 @@ func newClientGuard(cfg clientGuardConfig) *clientGuard {
 		shardCap: cfg.maxClientStates / clientGuardShardCount,
 	}
 	for i := range g.shards {
-		g.shards[i].items = make(map[netip.Addr]*clientState, g.shardCap)
+		g.shards[i].items = make(map[clientKey]*clientState, g.shardCap)
 	}
 	return g
 }
 
-func clientShardIndex(ip netip.Addr) int {
-	b := ip.As16()
+func canonicalClientHost(hostport string) string {
+	hostport = strings.TrimSpace(strings.ToLower(hostport))
+	if hostport == "" {
+		return "<empty>"
+	}
+	if host, _, err := net.SplitHostPort(hostport); err == nil {
+		hostport = host
+	} else if strings.HasPrefix(hostport, "[") && strings.HasSuffix(hostport, "]") {
+		hostport = strings.TrimSuffix(strings.TrimPrefix(hostport, "["), "]")
+	}
+	hostport = strings.TrimSuffix(hostport, ".")
+	if hostport == "" {
+		return "<empty>"
+	}
+	return hostport
+}
+
+func clientShardIndex(key clientKey) int {
+	b := key.ip.As16()
 	var h uint32 = 2166136261
 	for _, x := range b {
 		h ^= uint32(x)
 		h *= 16777619
 	}
+	for i := 0; i < len(key.host); i++ {
+		h ^= uint32(key.host[i])
+		h *= 16777619
+	}
 	return int(h % clientGuardShardCount)
 }
 
-func (g *clientGuard) getStateLocked(s *clientShard, ip netip.Addr, now time.Time) (*clientState, bool) {
-	if st, ok := s.items[ip]; ok {
+func clientIPKey(ip netip.Addr) clientKey {
+	return clientKey{ip: ip}
+}
+
+func clientHostKey(ip netip.Addr, hostport string) clientKey {
+	return clientKey{ip: ip, host: canonicalClientHost(hostport)}
+}
+
+func (g *clientGuard) getStateLocked(s *clientShard, key clientKey, now time.Time) (*clientState, bool) {
+	if st, ok := s.items[key]; ok {
 		st.lastSeen = now
 		return st, true
 	}
 
 	if len(s.items) >= g.shardCap {
-		var oldestIP netip.Addr
+		var oldestKey clientKey
 		var oldest *clientState
-		var expiredIP netip.Addr
+		var expiredKey clientKey
 		var expired *clientState
-		for candidateIP, candidate := range s.items {
+		for candidateKey, candidate := range s.items {
 			if candidate.ipConns != 0 || candidate.requests != 0 {
 				continue
 			}
 			if !candidate.lastSeen.Add(g.cfg.stateTTL).After(now) &&
 				(expired == nil || candidate.lastSeen.Before(expired.lastSeen)) {
-				expiredIP = candidateIP
+				expiredKey = candidateKey
 				expired = candidate
 			}
 			if oldest == nil || candidate.lastSeen.Before(oldest.lastSeen) {
-				oldestIP = candidateIP
+				oldestKey = candidateKey
 				oldest = candidate
 			}
 		}
 		if expired != nil {
-			delete(s.items, expiredIP)
+			delete(s.items, expiredKey)
 		} else if oldest != nil {
-			delete(s.items, oldestIP)
+			delete(s.items, oldestKey)
 		} else {
 			return nil, false
 		}
@@ -200,7 +234,7 @@ func (g *clientGuard) getStateLocked(s *clientShard, ip netip.Addr, now time.Tim
 		lastRefill: now,
 		lastSeen:   now,
 	}
-	s.items[ip] = st
+	s.items[key] = st
 	return st, true
 }
 
@@ -218,12 +252,12 @@ func refillTokens(st *clientState, now time.Time, rps float64, burst int) {
 	}
 }
 
-func (g *clientGuard) beginRequest(ip netip.Addr, now time.Time) bool {
-	s := &g.shards[clientShardIndex(ip)]
+func (g *clientGuard) beginRequest(key clientKey, now time.Time) bool {
+	s := &g.shards[clientShardIndex(key)]
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	st, ok := g.getStateLocked(s, ip, now)
+	st, ok := g.getStateLocked(s, key, now)
 	if !ok || st.requests >= g.cfg.maxIPRequests {
 		return false
 	}
@@ -237,11 +271,11 @@ func (g *clientGuard) beginRequest(ip netip.Addr, now time.Time) bool {
 	return true
 }
 
-func (g *clientGuard) endRequest(ip netip.Addr, now time.Time) {
-	s := &g.shards[clientShardIndex(ip)]
+func (g *clientGuard) endRequest(key clientKey, now time.Time) {
+	s := &g.shards[clientShardIndex(key)]
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if st, ok := s.items[ip]; ok {
+	if st, ok := s.items[key]; ok {
 		if st.requests > 0 {
 			st.requests--
 		}
@@ -250,11 +284,12 @@ func (g *clientGuard) endRequest(ip netip.Addr, now time.Time) {
 }
 
 func (g *clientGuard) openConnection(ip netip.Addr, now time.Time) bool {
-	s := &g.shards[clientShardIndex(ip)]
+	key := clientIPKey(ip)
+	s := &g.shards[clientShardIndex(key)]
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	st, ok := g.getStateLocked(s, ip, now)
+	st, ok := g.getStateLocked(s, key, now)
 	if !ok || st.ipConns >= g.cfg.maxIPConns {
 		return false
 	}
@@ -264,10 +299,11 @@ func (g *clientGuard) openConnection(ip netip.Addr, now time.Time) bool {
 }
 
 func (g *clientGuard) closeConnection(ip netip.Addr, now time.Time) {
-	s := &g.shards[clientShardIndex(ip)]
+	key := clientIPKey(ip)
+	s := &g.shards[clientShardIndex(key)]
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if st, ok := s.items[ip]; ok {
+	if st, ok := s.items[key]; ok {
 		if st.ipConns > 0 {
 			st.ipConns--
 		}
