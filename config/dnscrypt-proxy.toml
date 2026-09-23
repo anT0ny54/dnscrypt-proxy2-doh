@@ -24,7 +24,7 @@ listen_addresses = ['127.0.0.1:5300']
 # it at container startup from the DOH_MAX_INFLIGHT env var so the two never
 # drift apart at deploy time. Keep this literal in sync with the Go binary's
 # own `defaultMaxInflight` (main.go) and start.sh's fallback.
-max_clients = 32
+max_clients = 64
 
 ###############################################################################
 # Upstream selection
