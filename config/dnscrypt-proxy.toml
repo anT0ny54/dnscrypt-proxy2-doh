@@ -38,16 +38,21 @@ odoh_servers = false
 ###############################################################################
 
 # All configured upstreams are DoH over HTTPS. HTTP/3 is disabled to avoid
-# extra UDP socket/probing work on the small CPU budget. force_tcp only affects
-# the DNSCrypt protocol (unused here) and is left at its default.
-force_tcp = false
+# extra UDP socket/probing work on the small CPU budget.
 http3 = false
 http3_probe = false
-timeout = 5000
+
+# Upstream timeout in milliseconds. It must stay below the DoH gateway's
+# 5-second per-exchange budget (dnsExchangeTimeout): dnscrypt-proxy then gives
+# up first and answers SERVFAIL, and the client's in-flight slot is released
+# sooner during an upstream outage instead of the gateway timing out at the
+# same instant and returning HTTP 502.
+timeout = 4000
 
 # Three long-lived upstream connections have negligible memory cost here and
-# avoid repeated TLS setup on a small CPU budget.
-keepalive = 30
+# avoid repeated TLS setup on a small CPU budget. Idle connections are kept
+# for 2 minutes so quiet gaps between bursts do not force a new handshake.
+keepalive = 120
 
 ###############################################################################
 # Load balancing
@@ -97,7 +102,9 @@ reject_ttl = 10
 ###############################################################################
 
 cache = true
-cache_size = 8192
+# 16384 entries is roughly 16-64 MiB of heap, well inside DNSCRYPT_GOMEMLIMIT,
+# and raises the hit rate for many distinct users on a shared instance.
+cache_size = 16384
 cache_min_ttl = 60
 cache_max_ttl = 86400
 cache_neg_min_ttl = 60
