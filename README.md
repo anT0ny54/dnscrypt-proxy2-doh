@@ -54,11 +54,13 @@ The defaults are sized to serve as many users as a **512 MB / 0.25 vCPU** instan
 | `max_clients` | `64` | Fixed resolver-side concurrency ceiling; the gateway's `DOH_MAX_INFLIGHT` is hard-capped at the same value. |
 | `DOH_MAX_INFLIGHT` | `64` | Keeps HTTP and DNS concurrency aligned; values below `1` fall back to `64` and values above `64` clamp to `64`. |
 | `DOH_MAX_CONNS` | `256` | Global active TCP-connection cap (about 20 KiB per connection, so roughly 5 MiB at the default); excess connections are accepted then immediately closed. Idle keep-alive connections occupy a slot for up to `DOH_IDLE_TIMEOUT`, so this is what bounds the number of simultaneously connected clients. |
-| `DOH_RATE_RPS` | `3` (180/min) | Per-client-IP + Host sustained token-bucket refill rate. Sized so several users behind one NAT/CGNAT address do not throttle each other. |
-| `DOH_RATE_BURST` | `120` | Per-client-IP + Host burst, so a browser start-up or page load is never throttled. |
-| `DOH_MAX_IP_CONNS` | `32` | Per-source-IP active TCP connection cap; excess connections are immediately closed. Configured trusted proxies are exempt (see below). |
-| `DOH_MAX_IP_REQUESTS` | `64` | Concurrent DoH requests per client IP + Host. |
-| `DOH_MAX_CLIENT_STATES` | `8192` | Hard-bounded IP + Host rate-state entries across 16 shards (about 2 MiB). |
+| `DOH_RATE_LIMIT` | `12` (720/min) | Per-source-IP sustained token-bucket refill rate. All Host values share the same bucket. |
+| `DOH_RATE_BURST` | `200` | Per-source-IP burst, sized for strict-DoH browser startup/navigation bursts. |
+| `GLOBAL_RATE_LIMIT` | `80` (4800/min) | Gateway-wide sustained request rate shared by all source IPs. |
+| `GLOBAL_RATE_BURST` | `200` | Gateway-wide burst allowance for short browser request bursts. |
+| `IP_CONN_LIMIT` | `32` | Per-source-IP active TCP connection cap; excess connections are immediately closed. Configured trusted proxies are exempt (see below). |
+| `DOH_MAX_IP_REQUESTS` | `64` | Concurrent DoH requests per source IP. |
+| `DOH_MAX_CLIENT_STATES` | `8192` | Hard-bounded source-IP rate-state entries across 16 shards (about 2 MiB). |
 | `DOH_MAX_UDP_PACKET` | `8192` | Resolver-leg UDP packet limit; oversized UDP responses are silently dropped. |
 | `DOH_MAX_TCP_FRAME` | `8192` | Resolver-leg DNS-over-TCP frame limit, checked before body allocation/parsing. |
 | `DOH_MAX_BODY` | `4096` | Public DoH request DNS-message limit. The effective value cannot exceed `DOH_MAX_TCP_FRAME`. |
@@ -66,36 +68,27 @@ The defaults are sized to serve as many users as a **512 MB / 0.25 vCPU** instan
 | `DOH_GOMEMLIMIT` | `80MiB` | Gateway Go heap target for the 512 MiB container. |
 | `GOMAXPROCS` | `1` | Avoids running two tiny Go services as if the host had many CPUs. |
 | DNS cache (`cache_size`) | `16384` entries | Roughly 16-64 MiB of heap; a higher hit rate for many distinct users keeps upstream DoH work (and CPU) low. |
-| upstream `timeout` | `4000` ms | Deliberately below the gateway's 5 s exchange budget so the resolver answers SERVFAIL before the gateway gives up, and slots are freed sooner during an upstream outage. |
+| upstream `timeout` | `5000` ms | Kept below the gateway's 6 s `SERVER_TIMEOUT` so the resolver can answer before the gateway deadline during an upstream outage. |
 | upstream `keepalive` | `120` s | Long-lived connections to the three DoH resolvers; avoids repeated TLS handshakes on a small CPU budget. |
 | `cert_refresh_concurrency` / `cert_refresh_delay` | `2` / `240` min | Limit how many resolvers are probed at once and how often they are re-probed. |
 
-The gateway sizes request headers for the worst supported Base64 GET representation, including percent-escaped standard Base64, rather than capping them at the DNS-message limit. It uses a **5-second** read timeout, a **7-second** write timeout, and a **120-second** idle timeout. Each DNS exchange gets one combined **5-second** budget, including a possible UDP-to-TCP retry.
+The gateway sizes request headers for the worst supported Base64 GET representation, including percent-escaped standard Base64, rather than capping them at the DNS-message limit. It uses a **5-second** read timeout, an **8-second** write timeout, and a **120-second** idle timeout. Each DNS exchange gets one combined **6-second** `SERVER_TIMEOUT` budget, including a possible UDP-to-TCP retry.
 
-The public DoH guard uses a sharded token bucket keyed by client IP + canonical Host and bounded client state. Multiple browsers/devices behind the same public IP share the same Host-specific bucket; different Host values on that IP get independent request budgets. The default sustained rate is **3 requests per second (180 per minute)** per IP + Host, with a **120-request** burst. Rate/concurrency rejection happens before base64/DNS parsing, while transport-level overflow is handled separately: oversized UDP datagrams are silently discarded and oversized TCP DNS frames are rejected immediately after the two-byte length prefix, before body allocation. The current TCP fallback opens one connection per DNS exchange, so the maximum queries per TCP connection is fixed at **1**.
+The public DoH guard uses a sharded token bucket keyed **only by source IP**, plus a gateway-wide token bucket. Multiple browsers/devices behind the same public IP therefore share the per-IP request budget, and changing the Host header cannot create another per-IP bucket. The default sustained per-IP rate is **12 requests per second (720 per minute)** with a **200-request** burst; the gateway-wide default is **80 requests per second (4800 per minute)** with a **200-request** burst. Rate/concurrency rejection happens before base64/DNS parsing, while transport-level overflow is handled separately: oversized UDP datagrams are silently discarded and oversized TCP DNS frames are rejected immediately after the two-byte length prefix, before body allocation. The current TCP fallback opens one connection per DNS exchange, so the maximum queries per TCP connection is fixed at **1**.
 
-The 7-second HTTP write deadline deliberately exceeds the 5-second DNS budget because Go's `net/http` write deadline covers the whole request handling interval, not only the final socket write.
+The 8-second HTTP write deadline deliberately exceeds the 6-second DNS budget because Go's `net/http` write deadline covers the whole request handling interval, not only the final socket write.
 
 The two `GOMEMLIMIT` values total 368 MiB, leaving roughly 144 MiB of the 512 MiB container budget for non-heap runtime costs, static binaries, stacks, and traffic overhead. `GOMEMLIMIT` is a soft heap target, not a hard cap, and it does not account for goroutine stacks, the Go runtime's own non-heap bookkeeping, the static binaries, or OS/container overhead.
 
 ### Running behind a reverse proxy (SnapDeploy)
 
-SnapDeploy terminates TLS in front of the container, so without further configuration **every user reaches the gateway from the platform proxy's address**. The gateway then sees a single client: all users would share one rate bucket. Set `DOH_TRUSTED_PROXY_CIDRS` to the proxy's network(s) so the real client IP is taken from `X-Forwarded-For` (the gateway logs a hint at startup while the variable is unset). Connections from a trusted proxy are also exempt from the per-source-IP connection cap (`DOH_MAX_IP_CONNS`), because they carry many users; they still count against the global `DOH_MAX_CONNS` cap.
+SnapDeploy terminates TLS in front of the container, so without further configuration **every user reaches the gateway from the platform proxy's address**. The gateway then sees a single client: all users would share one rate bucket. Set `DOH_TRUSTED_PROXY_CIDRS` to the proxy's network(s) so the real client IP is taken from `X-Forwarded-For` (the gateway logs a hint at startup while the variable is unset). Connections from a trusted proxy are also exempt from the per-source-IP connection cap (`IP_CONN_LIMIT`), because they carry many users; they still count against the global `DOH_MAX_CONNS` cap.
 
 Only list networks you actually trust: a trusted peer can choose which client IP a request is attributed to.
 
-### Conservative reference profile
+### Legacy compatibility
 
-If you prefer the earlier, stricter profile (comparable to a 512 MB / 0.25 vCPU MosDNS deployment), override these variables:
-
-| Variable | Conservative value |
-| :--- | :--- |
-| `DOH_RATE_RPS` | `1.6666667` (100/60s) |
-| `DOH_RATE_BURST` | `80` |
-| `DOH_MAX_CONNS` | `96` |
-| `DOH_MAX_CLIENT_STATES` | `4096` |
-
-There is no separate global request-rate bucket in this gateway. `DOH_MAX_INFLIGHT=64` is the bounded global work ceiling and `DOH_MAX_CONNS` is the global connection cap.
+The older environment names `DOH_RATE_RPS` and `DOH_MAX_IP_CONNS` remain accepted as aliases for `DOH_RATE_LIMIT` and `IP_CONN_LIMIT`. When both names are set, the new variable takes precedence.
 
 ## DoH behavior and hardening
 
@@ -115,7 +108,7 @@ Security/resource controls include:
 - no query log, NX log, cloaking, forwarding, monitoring UI, or hot reload;
 - unprivileged runtime user;
 - bounded request size, header size, in-flight work, and connections;
-- per-client-IP + Host token-bucket rate limiting and a concurrent-request cap per client IP + Host, plus a per-source-IP TCP connection cap;
+- source-IP-only token-bucket rate limiting and a concurrent-request cap per source IP, plus a gateway-wide request-rate bucket and a per-source-IP TCP connection cap;
 - bounded source-IP state with idle-only eviction;
 - immediate TCP closes for global/per-source connection abuse;
 - silent dropping of oversized UDP response datagrams;
@@ -126,7 +119,28 @@ Security/resource controls include:
 
 This remains an **open** DoH endpoint with no authentication. The guard adds source-IP rate and concurrency controls, but it is not a substitute for an upstream WAF/CDN or an application-layer authentication policy. With a reverse proxy in front, configure `DOH_TRUSTED_PROXY_CIDRS` so the per-client limits can use the original client IP safely; forwarding headers are otherwise ignored.
 
-Because the rate-bucket key includes the client-supplied `Host` header, a client that can send arbitrary `Host` values obtains a separate bucket per value. The global `DOH_MAX_INFLIGHT`, `DOH_MAX_CONNS` and `DOH_MAX_CLIENT_STATES` bounds still apply, and a platform proxy that only routes your own hostnames removes the issue in practice.
+The request-rate bucket is keyed only by source IP, so arbitrary `Host` values cannot create additional per-IP buckets. The global `GLOBAL_RATE_LIMIT`, `GLOBAL_RATE_BURST`, `DOH_MAX_INFLIGHT`, `DOH_MAX_CONNS` and `DOH_MAX_CLIENT_STATES` bounds still apply.
+
+## Browser strict-DoH profile
+
+The shipped defaults are tuned for Chrome and Firefox strict DoH / maximum-protection behavior, where navigation can create short request bursts, connections may be opened or closed rapidly, and in-flight requests can be canceled when page or network state changes:
+
+```text
+DOH_RATE_LIMIT=12
+DOH_RATE_BURST=200
+GLOBAL_RATE_LIMIT=80
+GLOBAL_RATE_BURST=200
+IP_CONN_LIMIT=32
+SERVER_TIMEOUT=6
+```
+
+The per-IP request controls are keyed only by the source IP. Multiple devices behind one public address therefore share the same per-IP quota; changing `Host` does not create another bucket. `GLOBAL_RATE_LIMIT` and `GLOBAL_RATE_BURST` add an aggregate gateway-wide ceiling on request starts.
+
+A normal browser/client disconnect is expected and is silently canceled. A backend timeout or an invalid DNS response is different: the gateway returns **502 Bad Gateway** instead of sending a truncated or malformed **200 OK** response.
+
+`SERVER_TIMEOUT` is the gateway's total local DNS query deadline. UDP and TCP fallback share that single deadline, so a fallback attempt cannot create another full timeout window.
+
+The runtime has no persisted probe-state database. `/readyz` uses one small in-memory cached result, and therefore cannot load oversized or malformed state or consume unbounded startup memory.
 
 ## SnapDeploy environment
 
@@ -141,11 +155,14 @@ Safe defaults are built into the image. Normally only `PORT` needs to match the 
 | `DOH_MAX_BODY` | `4096` | Public request DNS-message limit; effective cap is the lower of this value and `DOH_MAX_TCP_FRAME`. |
 | `DOH_MAX_INFLIGHT` | `64` | Hard-capped at `64`; keeps concurrent DNS work proportionate to 0.25 vCPU. |
 | `DOH_MAX_CONNS` | `256` | Hard-capped at `1024`; excess accepted connections are immediately closed. |
-| `DOH_RATE_RPS` | `3` (180/min) | Per-client-IP + Host sustained rate; hard-capped at `100`. |
-| `DOH_RATE_BURST` | `120` | Per-client-IP + Host burst; hard-capped at `256`. |
-| `DOH_MAX_IP_CONNS` | `32` | Per-source-IP active connection cap (trusted proxies exempt); hard-capped at `32`. |
-| `DOH_MAX_IP_REQUESTS` | `64` | Concurrent request cap per client IP + Host; hard-capped at `64`. |
-| `DOH_MAX_CLIENT_STATES` | `8192` | Bounded to `16`-`32768`, rounded down to a multiple of the 16 guard shards; rate state is keyed by IP + Host. |
+| `DOH_RATE_LIMIT` | `12` (720/min) | Per-source-IP sustained rate; hard-capped at `100`. Legacy `DOH_RATE_RPS` remains accepted as an alias. |
+| `DOH_RATE_BURST` | `200` | Per-source-IP burst; hard-capped at `256`. |
+| `GLOBAL_RATE_LIMIT` | `80` (4800/min) | Gateway-wide sustained rate; hard-capped at `500`. |
+| `GLOBAL_RATE_BURST` | `200` | Gateway-wide burst; hard-capped at `512`. |
+| `IP_CONN_LIMIT` | `32` | Per-source-IP active connection cap (trusted proxies exempt); hard-capped at `32`. Legacy `DOH_MAX_IP_CONNS` remains accepted as an alias. |
+| `DOH_MAX_IP_REQUESTS` | `64` | Concurrent request cap per source IP; hard-capped at `64`. |
+| `DOH_MAX_CLIENT_STATES` | `8192` | Bounded to `16`-`32768`, rounded down to a multiple of the 16 guard shards; rate state is keyed only by source IP. |
+| `SERVER_TIMEOUT` | `6` seconds | Shared local DNS exchange deadline, including UDP-to-TCP fallback; client disconnect cancellation remains separate. |
 | `DOH_MAX_UDP_PACKET` | `8192` | Resolver-leg UDP packet limit; hard-capped at `65535`. |
 | `DOH_MAX_TCP_FRAME` | `8192` | Resolver-leg TCP DNS frame limit; hard-capped at `65535`. |
 | `DOH_TRUSTED_PROXY_CIDRS` | unset | Comma-separated trusted proxy prefixes (for example `10.0.0.0/8,172.16.0.0/12`); only then is `X-Forwarded-For` used. **Set this behind the platform proxy**, see above. |
@@ -154,7 +171,7 @@ Safe defaults are built into the image. Normally only `PORT` needs to match the 
 | `DOH_GOMEMLIMIT` | `80MiB` | DoH gateway Go heap target. |
 | `PUBLIC_DOH_URL` | unset | Optional startup log only; does not change routing. |
 
-`DNS_LISTEN` and `SERVER_NAMES` are intentionally not runtime settings. The internal listener and resolver set remain fixed so deployment variables cannot accidentally change the topology or upstream policy. The TCP DNS fallback is intentionally one-shot: each connection handles exactly one query before closing.
+`DNS_LISTEN` and `SERVER_NAMES` are intentionally not runtime settings. The internal listener and resolver set remain fixed so deployment variables cannot accidentally change the topology or upstream policy. The TCP DNS fallback is intentionally one-shot: each connection handles exactly one query before closing. Client disconnects are treated as normal cancellation and are not logged as upstream failures. Backend timeouts and invalid DNS responses are returned as **502 Bad Gateway**.
 
 ## Health endpoints
 
@@ -168,7 +185,7 @@ Liveness check for the gateway process. Returns `ok`.
 GET /readyz
 ```
 
-Readiness check for the gateway plus the local dnscrypt-proxy TCP listener. Returns `ready` only when that backend listener can accept a TCP connection. The probe result is cached for one second so repeated requests cannot multiply connections to the resolver.
+Readiness check for the gateway plus the local dnscrypt-proxy TCP listener. Returns `ready` only when that backend listener can accept a TCP connection. The probe result is cached in memory for one second, with no persisted probe-state file, so probe state cannot grow without bound or consume unbounded startup memory.
 
 The Docker `HEALTHCHECK` uses `/readyz`.
 
@@ -232,7 +249,9 @@ Do not build directly from an unreleased upstream `master` commit for the produc
 
 ## Validation
 
-The three checked-in HaGeZi stamps were last compared with the upstream server table on **2026-09-23**. The 2026-09-24 revision (see `CHANGELOG.md`) changed defaults and gateway code, and its tests were updated, but they were **not executed** where the revision was prepared (no Go toolchain or network was available). Before deploying, run:
+The gateway test suite was executed successfully after the strict-DoH changes. The available runner had Go **1.23.2**, while the production module remains pinned to **Go 1.27** in `doh-gateway/go.mod`; the test run therefore used a temporary test-only module-version override. The production file was not changed.
+
+Before deploying, run the same checks with the production toolchain:
 
 ```bash
 cd doh-gateway
