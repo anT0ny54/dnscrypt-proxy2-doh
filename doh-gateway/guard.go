@@ -16,18 +16,22 @@ import (
 )
 
 const (
-	defaultDoHRPS          = 3.0 // 180 requests per minute sustained per client IP + Host
-	defaultDoHBurst        = 120
-	defaultDoHIPConns      = 32
+	defaultDoHRateLimit    = 12.0 // sustained requests/sec per source IP
+	defaultDoHRateBurst    = 200
+	defaultGlobalRateLimit = 80.0 // sustained requests/sec across the gateway
+	defaultGlobalRateBurst = 200
+	defaultIPConnLimit     = 32
 	defaultDoHIPRequests   = 64
 	defaultDoHClientStates = 8192
 	defaultDoHStateTTL     = 5 * time.Minute
 	defaultMaxUDPPacket    = 8 << 10
 	defaultMaxTCPFrame     = 8 << 10
 	defaultMaxTCPQueries   = 1
-	maxDoHRPS              = 100.0
-	maxDoHBurst            = 256
-	maxDoHIPConns          = 32
+	maxDoHRateLimit        = 100.0
+	maxDoHRateBurst        = 256
+	maxGlobalRateLimit     = 500.0
+	maxGlobalRateBurst     = 512
+	maxIPConnLimit         = 32
 	maxDoHIPRequests       = 64
 	maxDoHClientStates     = 32768
 	minDoHClientStates     = 16
@@ -59,8 +63,10 @@ func dnsTransportLimitsFromEnv() dnsTransportLimits {
 }
 
 type clientGuardConfig struct {
-	rps               float64
-	burst             int
+	rateLimit         float64
+	rateBurst         int
+	globalRateLimit   float64
+	globalRateBurst   int
 	maxIPConns        int
 	maxIPRequests     int
 	maxClientStates   int
@@ -69,9 +75,11 @@ type clientGuardConfig struct {
 }
 
 func clientGuardConfigFromEnv() (clientGuardConfig, error) {
-	rps := envFloat("DOH_RATE_RPS", defaultDoHRPS, 0.1, maxDoHRPS)
-	burst := envInt("DOH_RATE_BURST", defaultDoHBurst, 1, maxDoHBurst)
-	maxIPConns := envInt("DOH_MAX_IP_CONNS", defaultDoHIPConns, 1, maxDoHIPConns)
+	rateLimit := envFloatAlias("DOH_RATE_LIMIT", "DOH_RATE_RPS", defaultDoHRateLimit, 0.1, maxDoHRateLimit)
+	rateBurst := envInt("DOH_RATE_BURST", defaultDoHRateBurst, 1, maxDoHRateBurst)
+	globalRateLimit := envFloat("GLOBAL_RATE_LIMIT", defaultGlobalRateLimit, 0.1, maxGlobalRateLimit)
+	globalRateBurst := envInt("GLOBAL_RATE_BURST", defaultGlobalRateBurst, 1, maxGlobalRateBurst)
+	maxIPConns := envIntAlias("IP_CONN_LIMIT", "DOH_MAX_IP_CONNS", defaultIPConnLimit, 1, maxIPConnLimit)
 	maxIPRequests := envInt("DOH_MAX_IP_REQUESTS", defaultDoHIPRequests, 1, maxDoHIPRequests)
 	maxStates := envInt("DOH_MAX_CLIENT_STATES", defaultDoHClientStates, minDoHClientStates, maxDoHClientStates)
 	maxStates = (maxStates / clientGuardShardCount) * clientGuardShardCount
@@ -85,8 +93,10 @@ func clientGuardConfigFromEnv() (clientGuardConfig, error) {
 	}
 
 	return clientGuardConfig{
-		rps:               rps,
-		burst:             burst,
+		rateLimit:         rateLimit,
+		rateBurst:         rateBurst,
+		globalRateLimit:   globalRateLimit,
+		globalRateBurst:   globalRateBurst,
 		maxIPConns:        maxIPConns,
 		maxIPRequests:     maxIPRequests,
 		maxClientStates:   maxStates,
@@ -118,8 +128,7 @@ func parseTrustedProxyCIDRs(value string) ([]netip.Prefix, error) {
 }
 
 type clientKey struct {
-	ip   netip.Addr
-	host string
+	ip netip.Addr
 }
 
 type clientState struct {
@@ -140,37 +149,49 @@ type clientShard struct {
 // Eviction only removes idle entries, so active connection/request accounting is
 // never lost underneath a live client.
 type clientGuard struct {
-	cfg      clientGuardConfig
-	shards   [clientGuardShardCount]clientShard
-	shardCap int
+	cfg              clientGuardConfig
+	shards           [clientGuardShardCount]clientShard
+	shardCap         int
+	globalMu         sync.Mutex
+	globalTokens     float64
+	globalLastRefill time.Time
 }
 
 func newClientGuard(cfg clientGuardConfig) *clientGuard {
+	if cfg.rateLimit <= 0 {
+		cfg.rateLimit = defaultDoHRateLimit
+	}
+	if cfg.rateBurst <= 0 {
+		cfg.rateBurst = defaultDoHRateBurst
+	}
+	if cfg.globalRateLimit <= 0 {
+		cfg.globalRateLimit = defaultGlobalRateLimit
+	}
+	if cfg.globalRateBurst <= 0 {
+		cfg.globalRateBurst = defaultGlobalRateBurst
+	}
+	if cfg.maxIPConns <= 0 {
+		cfg.maxIPConns = defaultIPConnLimit
+	}
+	if cfg.maxIPRequests <= 0 {
+		cfg.maxIPRequests = defaultDoHIPRequests
+	}
+	if cfg.maxClientStates < minDoHClientStates {
+		cfg.maxClientStates = minDoHClientStates
+	}
+	cfg.maxClientStates = (cfg.maxClientStates / clientGuardShardCount) * clientGuardShardCount
+	if cfg.stateTTL <= 0 {
+		cfg.stateTTL = defaultDoHStateTTL
+	}
 	g := &clientGuard{
-		cfg:      cfg,
-		shardCap: cfg.maxClientStates / clientGuardShardCount,
+		cfg:          cfg,
+		shardCap:     cfg.maxClientStates / clientGuardShardCount,
+		globalTokens: float64(cfg.globalRateBurst),
 	}
 	for i := range g.shards {
 		g.shards[i].items = make(map[clientKey]*clientState, g.shardCap)
 	}
 	return g
-}
-
-func canonicalClientHost(hostport string) string {
-	hostport = strings.TrimSpace(strings.ToLower(hostport))
-	if hostport == "" {
-		return "<empty>"
-	}
-	if host, _, err := net.SplitHostPort(hostport); err == nil {
-		hostport = host
-	} else if strings.HasPrefix(hostport, "[") && strings.HasSuffix(hostport, "]") {
-		hostport = strings.TrimSuffix(strings.TrimPrefix(hostport, "["), "]")
-	}
-	hostport = strings.TrimSuffix(hostport, ".")
-	if hostport == "" {
-		return "<empty>"
-	}
-	return hostport
 }
 
 func clientShardIndex(key clientKey) int {
@@ -180,19 +201,11 @@ func clientShardIndex(key clientKey) int {
 		h ^= uint32(x)
 		h *= 16777619
 	}
-	for i := 0; i < len(key.host); i++ {
-		h ^= uint32(key.host[i])
-		h *= 16777619
-	}
 	return int(h % clientGuardShardCount)
 }
 
 func clientIPKey(ip netip.Addr) clientKey {
 	return clientKey{ip: ip}
-}
-
-func clientHostKey(ip netip.Addr, hostport string) clientKey {
-	return clientKey{ip: ip, host: canonicalClientHost(hostport)}
 }
 
 func (g *clientGuard) getStateLocked(s *clientShard, key clientKey, now time.Time) (*clientState, bool) {
@@ -230,7 +243,7 @@ func (g *clientGuard) getStateLocked(s *clientShard, key clientKey, now time.Tim
 	}
 
 	st := &clientState{
-		tokens:     float64(g.cfg.burst),
+		tokens:     float64(g.cfg.rateBurst),
 		lastRefill: now,
 		lastSeen:   now,
 	}
@@ -238,13 +251,13 @@ func (g *clientGuard) getStateLocked(s *clientShard, key clientKey, now time.Tim
 	return st, true
 }
 
-func refillTokens(st *clientState, now time.Time, rps float64, burst int) {
+func refillTokens(st *clientState, now time.Time, rate float64, burst int) {
 	if now.Before(st.lastRefill) {
 		return
 	}
 	elapsed := now.Sub(st.lastRefill).Seconds()
 	if elapsed > 0 {
-		st.tokens += elapsed * rps
+		st.tokens += elapsed * rate
 		if st.tokens > float64(burst) {
 			st.tokens = float64(burst)
 		}
@@ -252,7 +265,29 @@ func refillTokens(st *clientState, now time.Time, rps float64, burst int) {
 	}
 }
 
-func (g *clientGuard) beginRequest(key clientKey, now time.Time) bool {
+func (g *clientGuard) takeGlobalToken(now time.Time) bool {
+	g.globalMu.Lock()
+	defer g.globalMu.Unlock()
+
+	if g.globalLastRefill.IsZero() {
+		g.globalLastRefill = now
+	} else if !now.Before(g.globalLastRefill) {
+		elapsed := now.Sub(g.globalLastRefill).Seconds()
+		g.globalTokens += elapsed * g.cfg.globalRateLimit
+		if g.globalTokens > float64(g.cfg.globalRateBurst) {
+			g.globalTokens = float64(g.cfg.globalRateBurst)
+		}
+		g.globalLastRefill = now
+	}
+	if g.globalTokens < 1 {
+		return false
+	}
+	g.globalTokens--
+	return true
+}
+
+func (g *clientGuard) beginRequest(ip netip.Addr, now time.Time) bool {
+	key := clientIPKey(ip)
 	s := &g.shards[clientShardIndex(key)]
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -261,8 +296,11 @@ func (g *clientGuard) beginRequest(key clientKey, now time.Time) bool {
 	if !ok || st.requests >= g.cfg.maxIPRequests {
 		return false
 	}
-	refillTokens(st, now, g.cfg.rps, g.cfg.burst)
+	refillTokens(st, now, g.cfg.rateLimit, g.cfg.rateBurst)
 	if st.tokens < 1 {
+		return false
+	}
+	if !g.takeGlobalToken(now) {
 		return false
 	}
 	st.tokens--
@@ -271,7 +309,8 @@ func (g *clientGuard) beginRequest(key clientKey, now time.Time) bool {
 	return true
 }
 
-func (g *clientGuard) endRequest(key clientKey, now time.Time) {
+func (g *clientGuard) endRequest(ip netip.Addr, now time.Time) {
+	key := clientIPKey(ip)
 	s := &g.shards[clientShardIndex(key)]
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -484,7 +523,7 @@ func (c *guardedTCPDNSConn) exchange(ctx context.Context, q []byte) ([]byte, err
 	}
 	c.queries++
 
-	setConnDeadline(ctx, c.conn)
+	setConnDeadline(ctx, c.conn, defaultServerTimeout)
 	frame := []byte{byte(len(q) >> 8), byte(len(q))}
 	frame = append(frame, q...)
 	if _, err := c.conn.Write(frame); err != nil {

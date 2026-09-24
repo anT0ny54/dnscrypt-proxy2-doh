@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -79,8 +80,12 @@ func TestDoHConcurrencyAndTimeoutDefaultsStayCapped(t *testing.T) {
 
 func TestTunedDefaults(t *testing.T) {
 	for _, key := range []string{
+		"DOH_RATE_LIMIT",
 		"DOH_RATE_RPS",
 		"DOH_RATE_BURST",
+		"GLOBAL_RATE_LIMIT",
+		"GLOBAL_RATE_BURST",
+		"IP_CONN_LIMIT",
 		"DOH_MAX_IP_CONNS",
 		"DOH_MAX_IP_REQUESTS",
 		"DOH_MAX_CLIENT_STATES",
@@ -92,14 +97,20 @@ func TestTunedDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("clientGuardConfigFromEnv() error = %v", err)
 	}
-	if cfg.rps != defaultDoHRPS {
-		t.Fatalf("default DoH RPS = %v, want %v", cfg.rps, defaultDoHRPS)
+	if cfg.rateLimit != defaultDoHRateLimit {
+		t.Fatalf("default DoH rate limit = %v, want %v", cfg.rateLimit, defaultDoHRateLimit)
 	}
-	if cfg.burst != defaultDoHBurst {
-		t.Fatalf("default DoH burst = %d, want %d", cfg.burst, defaultDoHBurst)
+	if cfg.rateBurst != defaultDoHRateBurst {
+		t.Fatalf("default DoH rate burst = %d, want %d", cfg.rateBurst, defaultDoHRateBurst)
 	}
-	if cfg.maxIPConns != defaultDoHIPConns {
-		t.Fatalf("default per-IP connections = %d, want %d", cfg.maxIPConns, defaultDoHIPConns)
+	if cfg.globalRateLimit != defaultGlobalRateLimit {
+		t.Fatalf("default global rate limit = %v, want %v", cfg.globalRateLimit, defaultGlobalRateLimit)
+	}
+	if cfg.globalRateBurst != defaultGlobalRateBurst {
+		t.Fatalf("default global rate burst = %d, want %d", cfg.globalRateBurst, defaultGlobalRateBurst)
+	}
+	if cfg.maxIPConns != defaultIPConnLimit {
+		t.Fatalf("default per-IP connections = %d, want %d", cfg.maxIPConns, defaultIPConnLimit)
 	}
 	if cfg.maxIPRequests != defaultDoHIPRequests {
 		t.Fatalf("default per-IP requests = %d, want %d", cfg.maxIPRequests, defaultDoHIPRequests)
@@ -118,45 +129,87 @@ func TestTunedDefaults(t *testing.T) {
 	}
 }
 
+func TestServerTimeoutDefaultsAndEnv(t *testing.T) {
+	t.Setenv("SERVER_TIMEOUT", "")
+	if got := serverTimeoutFromEnv(); got != 6*time.Second {
+		t.Fatalf("default SERVER_TIMEOUT = %s, want 6s", got)
+	}
+	t.Setenv("SERVER_TIMEOUT", "9")
+	if got := serverTimeoutFromEnv(); got != 9*time.Second {
+		t.Fatalf("SERVER_TIMEOUT=9 parsed as %s, want 9s", got)
+	}
+	t.Setenv("SERVER_TIMEOUT", "999")
+	if got := serverTimeoutFromEnv(); got != 60*time.Second {
+		t.Fatalf("SERVER_TIMEOUT over max parsed as %s, want 60s", got)
+	}
+}
+
+func TestRateAndConnectionEnvAliases(t *testing.T) {
+	for _, key := range []string{"DOH_RATE_LIMIT", "DOH_RATE_RPS", "IP_CONN_LIMIT", "DOH_MAX_IP_CONNS"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("DOH_RATE_RPS", "9")
+	t.Setenv("DOH_MAX_IP_CONNS", "7")
+	cfg, err := clientGuardConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.rateLimit != 9 || cfg.maxIPConns != 7 {
+		t.Fatalf("legacy aliases produced rate=%v/ipconns=%d, want 9/7", cfg.rateLimit, cfg.maxIPConns)
+	}
+	t.Setenv("DOH_RATE_LIMIT", "11")
+	t.Setenv("IP_CONN_LIMIT", "8")
+	cfg, err = clientGuardConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.rateLimit != 11 || cfg.maxIPConns != 8 {
+		t.Fatalf("primary env values did not take precedence: rate=%v/ipconns=%d", cfg.rateLimit, cfg.maxIPConns)
+	}
+}
+
 func TestDefaultClientGuardStartupBurstAndSustainedRate(t *testing.T) {
 	g := newClientGuard(clientGuardConfig{
-		rps:             defaultDoHRPS,
-		burst:           defaultDoHBurst,
-		maxIPConns:      defaultDoHIPConns,
+		rateLimit:       defaultDoHRateLimit,
+		rateBurst:       defaultDoHRateBurst,
+		globalRateLimit: defaultGlobalRateLimit,
+		globalRateBurst: defaultGlobalRateBurst,
+		maxIPConns:      defaultIPConnLimit,
 		maxIPRequests:   defaultDoHIPRequests,
 		maxClientStates: 16,
 		stateTTL:        defaultDoHStateTTL,
 	})
 	ip := netip.MustParseAddr("198.51.100.31")
-	key := clientHostKey(ip, "dns.example.test")
 	t0 := time.Unix(0, 0)
 
-	if defaultDoHBurst != 120 {
-		t.Fatalf("default startup burst = %d, want 120", defaultDoHBurst)
+	if defaultDoHRateBurst != 200 {
+		t.Fatalf("default startup burst = %d, want 200", defaultDoHRateBurst)
 	}
-	for i := 0; i < defaultDoHBurst; i++ {
-		if !g.beginRequest(key, t0) {
+	for i := 0; i < defaultDoHRateBurst; i++ {
+		if !g.beginRequest(ip, t0) {
 			t.Fatalf("startup burst request %d was rejected", i+1)
 		}
-		g.endRequest(key, t0)
+		g.endRequest(ip, t0)
 	}
-	if g.beginRequest(key, t0) {
-		t.Fatalf("request beyond the %d-request startup burst was accepted immediately", defaultDoHBurst)
+	if g.beginRequest(ip, t0) {
+		t.Fatalf("request beyond the %d-request startup burst was accepted immediately", defaultDoHRateBurst)
 	}
 
-	// One token refills every 1/defaultDoHRPS seconds (about 333ms at 3 rps).
-	rps := defaultDoHRPS
+	// One token refills every 1/defaultDoHRateLimit seconds (about 333ms at 3 rps).
+	rps := defaultDoHRateLimit
 	refillAt := t0.Add(time.Duration(float64(time.Second)/rps) + 10*time.Millisecond)
-	if !g.beginRequest(key, refillAt) {
+	if !g.beginRequest(ip, refillAt) {
 		t.Fatal("one-token sustained refill was rejected")
 	}
-	g.endRequest(key, refillAt)
+	g.endRequest(ip, refillAt)
 }
 
 func TestClientGuardRateAndConcurrency(t *testing.T) {
 	cfg := clientGuardConfig{
-		rps:             1,
-		burst:           2,
+		rateLimit:       1,
+		rateBurst:       2,
+		globalRateLimit: 100,
+		globalRateBurst: 100,
 		maxIPConns:      1,
 		maxIPRequests:   1,
 		maxClientStates: 16,
@@ -166,24 +219,24 @@ func TestClientGuardRateAndConcurrency(t *testing.T) {
 	ip := netip.MustParseAddr("198.51.100.10")
 	t0 := time.Unix(0, 0)
 
-	if !g.beginRequest(clientIPKey(ip), t0) {
+	if !g.beginRequest(ip, t0) {
 		t.Fatal("first request was rejected")
 	}
-	if g.beginRequest(clientIPKey(ip), t0) {
+	if g.beginRequest(ip, t0) {
 		t.Fatal("per-IP concurrent request limit was not enforced")
 	}
-	g.endRequest(clientIPKey(ip), t0)
-	if !g.beginRequest(clientIPKey(ip), t0) {
+	g.endRequest(ip, t0)
+	if !g.beginRequest(ip, t0) {
 		t.Fatal("second request should consume the burst token")
 	}
-	g.endRequest(clientIPKey(ip), t0)
-	if g.beginRequest(clientIPKey(ip), t0) {
+	g.endRequest(ip, t0)
+	if g.beginRequest(ip, t0) {
 		t.Fatal("token bucket allowed a third immediate request")
 	}
-	if !g.beginRequest(clientIPKey(ip), t0.Add(time.Second)) {
+	if !g.beginRequest(ip, t0.Add(time.Second)) {
 		t.Fatal("token bucket did not refill after one second")
 	}
-	g.endRequest(clientIPKey(ip), t0.Add(time.Second))
+	g.endRequest(ip, t0.Add(time.Second))
 
 	if !g.openConnection(ip, t0) {
 		t.Fatal("first connection was rejected")
@@ -194,10 +247,12 @@ func TestClientGuardRateAndConcurrency(t *testing.T) {
 	g.closeConnection(ip, t0)
 }
 
-func TestClientGuardRateIsPerIPAndHost(t *testing.T) {
+func TestClientGuardRateIsPerIPOnly(t *testing.T) {
 	cfg := clientGuardConfig{
-		rps:             1,
-		burst:           1,
+		rateLimit:       1,
+		rateBurst:       1,
+		globalRateLimit: 100,
+		globalRateBurst: 100,
 		maxIPConns:      1,
 		maxIPRequests:   8,
 		maxClientStates: 32,
@@ -207,37 +262,66 @@ func TestClientGuardRateIsPerIPAndHost(t *testing.T) {
 	ip := netip.MustParseAddr("198.51.100.30")
 	now := time.Unix(0, 0)
 
-	a := clientHostKey(ip, "DNS.Example.test:443")
-	b := clientHostKey(ip, "other.example.test")
-	if !g.beginRequest(a, now) {
-		t.Fatal("first request for host A was rejected")
+	if !g.beginRequest(ip, now) {
+		t.Fatal("first request was rejected")
 	}
-	g.endRequest(a, now)
-	if g.beginRequest(a, now) {
-		t.Fatal("second immediate request for the same IP + host should be rejected")
+	g.endRequest(ip, now)
+	if g.beginRequest(ip, now) {
+		t.Fatal("second immediate request from the same source IP should be rejected")
 	}
-	if !g.beginRequest(b, now) {
-		t.Fatal("same IP on a different host should have a separate rate bucket")
-	}
-	g.endRequest(b, now)
 
-	if clientHostKey(ip, "dns.example.test") != a {
-		t.Fatal("host normalization did not collapse case/port differences")
+	// Host values are intentionally ignored. A caller changing Host must not
+	// receive a second rate bucket.
+	if g.beginRequest(ip, now) {
+		t.Fatal("changing Host must not bypass the source-IP rate bucket")
 	}
 
 	if !g.openConnection(ip, now) {
 		t.Fatal("first per-IP connection was rejected")
 	}
 	if g.openConnection(ip, now) {
-		t.Fatal("per-IP connection cap was not aggregated across hosts")
+		t.Fatal("per-IP connection cap was not enforced")
 	}
 	g.closeConnection(ip, now)
 }
 
+func TestClientGuardGlobalRate(t *testing.T) {
+	g := newClientGuard(clientGuardConfig{
+		rateLimit:       100,
+		rateBurst:       100,
+		globalRateLimit: 1,
+		globalRateBurst: 2,
+		maxIPConns:      8,
+		maxIPRequests:   8,
+		maxClientStates: 32,
+		stateTTL:        5 * time.Minute,
+	})
+	now := time.Unix(0, 0)
+	ip1 := netip.MustParseAddr("198.51.100.31")
+	ip2 := netip.MustParseAddr("198.51.100.32")
+	ip3 := netip.MustParseAddr("198.51.100.33")
+
+	for _, ip := range []netip.Addr{ip1, ip2} {
+		if !g.beginRequest(ip, now) {
+			t.Fatalf("global burst request from %s was rejected", ip)
+		}
+		g.endRequest(ip, now)
+	}
+	if g.beginRequest(ip3, now) {
+		t.Fatal("request beyond the global burst was accepted")
+	}
+	if !g.beginRequest(ip3, now.Add(time.Second)) {
+		t.Fatal("global rate limiter did not refill after one second")
+	}
+	g.endRequest(ip3, now.Add(time.Second))
+}
+
 func TestClientGuardStateIsBounded(t *testing.T) {
 	cfg := clientGuardConfig{
-		rps:             10,
-		burst:           10,
+		rateLimit:       10,
+		rateBurst:       10,
+		globalRateLimit: 1000,
+		globalRateBurst: 1000,
 		maxIPConns:      1,
 		maxIPRequests:   1,
 		maxClientStates: 16,
@@ -248,12 +332,12 @@ func TestClientGuardStateIsBounded(t *testing.T) {
 
 	for i := 0; i < 5000; i++ {
 		ip := netip.AddrFrom4([4]byte{198, 51, byte(i >> 8), byte(i)})
-		if !g.beginRequest(clientIPKey(ip), now) {
+		if !g.beginRequest(ip, now) {
 			// A shard can be temporarily full of the same active entry, but the
 			// request is immediately released in this test so state remains bounded.
 			continue
 		}
-		g.endRequest(clientIPKey(ip), now)
+		g.endRequest(ip, now)
 	}
 	if got := g.stateCount(); got > cfg.maxClientStates {
 		t.Fatalf("client state count = %d, want <= %d", got, cfg.maxClientStates)
@@ -262,9 +346,11 @@ func TestClientGuardStateIsBounded(t *testing.T) {
 
 func TestDefaultClientGuardStateIsBounded(t *testing.T) {
 	cfg := clientGuardConfig{
-		rps:             defaultDoHRPS,
-		burst:           defaultDoHBurst,
-		maxIPConns:      defaultDoHIPConns,
+		rateLimit:       defaultDoHRateLimit,
+		rateBurst:       defaultDoHRateBurst,
+		globalRateLimit: defaultGlobalRateLimit,
+		globalRateBurst: defaultGlobalRateBurst,
+		maxIPConns:      defaultIPConnLimit,
 		maxIPRequests:   defaultDoHIPRequests,
 		maxClientStates: defaultDoHClientStates,
 		stateTTL:        defaultDoHStateTTL,
@@ -274,11 +360,10 @@ func TestDefaultClientGuardStateIsBounded(t *testing.T) {
 
 	for i := 0; i < cfg.maxClientStates+1024; i++ {
 		ip := netip.AddrFrom4([4]byte{198, 51, byte(i >> 8), byte(i)})
-		key := clientHostKey(ip, "dns.example.test")
-		if !g.beginRequest(key, now) {
+		if !g.beginRequest(ip, now) {
 			continue
 		}
-		g.endRequest(key, now)
+		g.endRequest(ip, now)
 	}
 	if got := g.stateCount(); got > cfg.maxClientStates {
 		t.Fatalf("default client state count = %d, want <= %d", got, cfg.maxClientStates)
@@ -291,8 +376,10 @@ func TestGuardListenerImmediateCloseWhenGlobalFull(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := clientGuardConfig{
-		rps:             10,
-		burst:           10,
+		rateLimit:       10,
+		rateBurst:       10,
+		globalRateLimit: 1000,
+		globalRateBurst: 1000,
 		maxIPConns:      4,
 		maxIPRequests:   4,
 		maxClientStates: 16,
@@ -420,6 +507,7 @@ func TestDNSExchangeUDPDropsOversizedDatagram(t *testing.T) {
 
 	query := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
 	want := append([]byte(nil), query...)
+	want[2] |= 0x80
 	go func() {
 		buf := make([]byte, maxDNSPacket)
 		n, client, err := udp.ReadFromUDP(buf)
@@ -512,6 +600,7 @@ func TestDNSExchangeUDPResponseIsNotAliasedToPooledBuffer(t *testing.T) {
 			if err != nil {
 				return
 			}
+			buf[2] |= 0x80
 			_, _ = udp.WriteToUDP(buf[:n], client)
 		}
 	}()
@@ -528,8 +617,10 @@ func TestDNSExchangeUDPResponseIsNotAliasedToPooledBuffer(t *testing.T) {
 	if _, err := dnsExchangeWithLimits(context.Background(), addr, q2, defaultDNSTransportLimits()); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(first, q1) {
-		t.Fatalf("first response changed after a second exchange: got %x, want %x", first, q1)
+	wantFirst := append([]byte(nil), q1...)
+	wantFirst[2] |= 0x80
+	if !bytes.Equal(first, wantFirst) {
+		t.Fatalf("first response changed after a second exchange: got %x, want %x", first, wantFirst)
 	}
 }
 
@@ -560,8 +651,103 @@ func TestDNSExchangeUDPTimeoutDoesNotFallBackToTCP(t *testing.T) {
 }
 
 func TestHTTPWriteTimeoutHasHeadroomOverDNSExchangeTimeout(t *testing.T) {
-	if httpWriteTimeout <= dnsExchangeTimeout {
-		t.Fatalf("httpWriteTimeout (%s) must be greater than dnsExchangeTimeout (%s)", httpWriteTimeout, dnsExchangeTimeout)
+	if httpWriteTimeout <= defaultServerTimeout {
+		t.Fatalf("httpWriteTimeout (%s) must be greater than defaultServerTimeout (%s)", httpWriteTimeout, defaultServerTimeout)
+	}
+}
+
+func TestDNSResponseValidation(t *testing.T) {
+	query := []byte{0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0}
+	valid := append([]byte(nil), query...)
+	valid[2] |= 0x80
+	if err := validateDNSResponse(query, valid); err != nil {
+		t.Fatalf("valid response rejected: %v", err)
+	}
+
+	badID := append([]byte(nil), valid...)
+	badID[1]++
+	if err := validateDNSResponse(query, badID); err == nil {
+		t.Fatal("transaction ID mismatch was accepted")
+	}
+
+	notResponse := append([]byte(nil), valid...)
+	notResponse[2] &^= 0x80
+	if err := validateDNSResponse(query, notResponse); err == nil {
+		t.Fatal("response without QR bit was accepted")
+	}
+
+	opcodeMismatch := append([]byte(nil), valid...)
+	opcodeMismatch[2] |= 0x08
+	if err := validateDNSResponse(query, opcodeMismatch); err == nil {
+		t.Fatal("response with opcode mismatch was accepted")
+	}
+}
+
+func TestDoHHandlerMapsInvalidBackendResponseTo502(t *testing.T) {
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+
+	go func() {
+		buf := make([]byte, maxDNSPacket)
+		n, client, err := udp.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		bad := append([]byte(nil), buf[:n]...)
+		bad[2] &^= 0x80
+		_, _ = udp.WriteToUDP(bad, client)
+	}()
+
+	query := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	h := dohHandlerWithGuard(udp.LocalAddr().String(), "/dns-query", maxDNSPacket, 1, defaultDNSTransportLimits(), nil, nil)
+	req := httptest.NewRequest(http.MethodPost, "/dns-query", bytes.NewReader(query))
+	rec := httptest.NewRecorder()
+	h(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("invalid backend response status = %d, want %d", rec.Code, http.StatusBadGateway)
+	}
+}
+
+func TestDoHHandlerClientDisconnectIsSilent(t *testing.T) {
+	var logs strings.Builder
+	oldWriter := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(oldWriter)
+
+	query := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	h := dohHandlerWithGuard("127.0.0.1:1", "/dns-query", maxDNSPacket, 1, defaultDNSTransportLimits(), nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, "/dns-query", bytes.NewReader(query)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	h(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("canceled request status = %d, want zero-value recorder status %d", rec.Code, http.StatusOK)
+	}
+	if got := logs.String(); got != "" {
+		t.Fatalf("client disconnect produced log output: %q", got)
+	}
+}
+
+func TestDoHHandlerMapsBackendTimeoutTo502(t *testing.T) {
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+
+	query := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	h := dohHandlerWithGuardTimeout(udp.LocalAddr().String(), "/dns-query", maxDNSPacket, 1, defaultDNSTransportLimits(), nil, nil, 50*time.Millisecond)
+	req := httptest.NewRequest(http.MethodPost, "/dns-query", bytes.NewReader(query))
+	rec := httptest.NewRecorder()
+	h(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("backend timeout status = %d, want %d", rec.Code, http.StatusBadGateway)
 	}
 }
 
@@ -580,12 +766,15 @@ func TestDoHHandlerGetStandardBase64Plus(t *testing.T) {
 			if err != nil {
 				return
 			}
+			buf[2] |= 0x80
 			_, _ = udp.WriteToUDP(buf[:n], client)
 		}
 	}()
 
 	// 0xf8 in the message makes the standard Base64 representation contain '+'.
 	query := []byte{0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xf8}
+	want := append([]byte(nil), query...)
+	want[2] |= 0x80
 	encoded := base64.StdEncoding.EncodeToString(query)
 	if !strings.Contains(encoded, "+") {
 		t.Fatalf("test fixture must contain '+': %q", encoded)
@@ -604,8 +793,8 @@ func TestDoHHandlerGetStandardBase64Plus(t *testing.T) {
 			if rec.Code != http.StatusOK {
 				t.Fatalf("standard Base64 GET status = %d, want %d", rec.Code, http.StatusOK)
 			}
-			if got := rec.Body.Bytes(); !bytes.Equal(got, query) {
-				t.Fatalf("standard Base64 GET response = %x, want %x", got, query)
+			if got := rec.Body.Bytes(); !bytes.Equal(got, want) {
+				t.Fatalf("standard Base64 GET response = %x, want %x", got, want)
 			}
 		})
 	}
@@ -710,6 +899,7 @@ func TestDoHHandlerGetAndPost(t *testing.T) {
 			if err != nil {
 				return
 			}
+			buf[2] |= 0x80
 			_, _ = udp.WriteToUDP(buf[:n], client)
 		}
 	}()
@@ -756,13 +946,16 @@ func TestDoHHandlerAppliesClientGuard(t *testing.T) {
 			if err != nil {
 				return
 			}
+			buf[2] |= 0x80
 			_, _ = udp.WriteToUDP(buf[:n], client)
 		}
 	}()
 
 	guard := newClientGuard(clientGuardConfig{
-		rps:             1,
-		burst:           1,
+		rateLimit:       1,
+		rateBurst:       1,
+		globalRateLimit: 100,
+		globalRateBurst: 100,
 		maxIPConns:      8,
 		maxIPRequests:   8,
 		maxClientStates: 16,
@@ -792,8 +985,8 @@ func TestDoHHandlerAppliesClientGuard(t *testing.T) {
 	req3.Host = "other.example.test"
 	rec3 := httptest.NewRecorder()
 	h(rec3, req3)
-	if rec3.Code != http.StatusOK {
-		t.Fatalf("different-host guarded request status = %d, want %d", rec3.Code, http.StatusOK)
+	if rec3.Code != http.StatusTooManyRequests {
+		t.Fatalf("different-host guarded request status = %d, want %d", rec3.Code, http.StatusTooManyRequests)
 	}
 }
 
@@ -843,8 +1036,8 @@ func TestGuardListenerTrustedProxyIsExemptFromPerIPConnectionCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	guard := newClientGuard(clientGuardConfig{
-		rps:               10,
-		burst:             10,
+		rateLimit:         10,
+		rateBurst:         10,
 		maxIPConns:        1,
 		maxIPRequests:     4,
 		maxClientStates:   16,
@@ -878,8 +1071,10 @@ func TestGuardListenerEnforcesPerIPConnectionCapForUntrustedPeers(t *testing.T) 
 		t.Fatal(err)
 	}
 	guard := newClientGuard(clientGuardConfig{
-		rps:             10,
-		burst:           10,
+		rateLimit:       10,
+		rateBurst:       10,
+		globalRateLimit: 1000,
+		globalRateBurst: 1000,
 		maxIPConns:      1,
 		maxIPRequests:   4,
 		maxClientStates: 16,

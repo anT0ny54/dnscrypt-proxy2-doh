@@ -24,14 +24,14 @@ import (
 const (
 	maxDNSPacket = 65535
 
-	// dnsExchangeTimeout bounds one full DNS exchange: the UDP attempt plus,
-	// if the response comes back truncated, the TCP retry.
-	dnsExchangeTimeout = 5 * time.Second
+	// defaultServerTimeout bounds one full local DNS exchange: the UDP attempt
+	// plus, if the response is truncated or UDP fails early, the TCP retry.
+	defaultServerTimeout = 6 * time.Second
 
-	// httpWriteTimeout must stay comfortably above dnsExchangeTimeout.
+	// httpWriteTimeout must stay comfortably above defaultServerTimeout.
 	// net/http's WriteTimeout deadline is set once, when request headers are
 	// read, and covers the entire handler plus the response write.
-	httpWriteTimeout = 7 * time.Second
+	httpWriteTimeout = 8 * time.Second
 	httpReadTimeout  = 5 * time.Second
 
 	defaultMaxBody        = 4 << 10 // 4 KiB request query limit
@@ -129,6 +129,25 @@ func envFloat(key string, fallback, min, max float64) float64 {
 		return max
 	}
 	return n
+}
+
+func envFloatAlias(primary, legacy string, fallback, min, max float64) float64 {
+	if strings.TrimSpace(os.Getenv(primary)) != "" {
+		return envFloat(primary, fallback, min, max)
+	}
+	return envFloat(legacy, fallback, min, max)
+}
+
+func envIntAlias(primary, legacy string, fallback, min, max int) int {
+	if strings.TrimSpace(os.Getenv(primary)) != "" {
+		return envInt(primary, fallback, min, max)
+	}
+	return envInt(legacy, fallback, min, max)
+}
+
+func serverTimeoutFromEnv() time.Duration {
+	seconds := envInt("SERVER_TIMEOUT", int(defaultServerTimeout/time.Second), 1, 60)
+	return time.Duration(seconds) * time.Second
 }
 
 // decodeQuery decodes a DoH "dns" GET parameter, which in practice arrives in
@@ -235,10 +254,10 @@ func watchCancel(ctx context.Context, conn net.Conn) (stop func()) {
 	return func() { _ = cancel() }
 }
 
-func setConnDeadline(ctx context.Context, conn net.Conn) {
+func setConnDeadline(ctx context.Context, conn net.Conn, fallbackTimeout time.Duration) {
 	deadline, ok := ctx.Deadline()
 	if !ok {
-		deadline = time.Now().Add(dnsExchangeTimeout)
+		deadline = time.Now().Add(fallbackTimeout)
 	}
 	_ = conn.SetDeadline(deadline)
 }
@@ -267,7 +286,7 @@ func dnsExchangeUDP(ctx context.Context, addr string, q []byte, maxUDPPacket int
 	}
 	defer conn.Close()
 	defer watchCancel(ctx, conn)()
-	setConnDeadline(ctx, conn)
+	setConnDeadline(ctx, conn, defaultServerTimeout)
 	if _, err := conn.Write(q); err != nil {
 		return nil, err
 	}
@@ -289,8 +308,15 @@ func dnsExchangeUDP(ctx context.Context, addr string, q []byte, maxUDPPacket int
 		if n < 12 {
 			return nil, errors.New("short DNS response")
 		}
+		response := (*bufp)[:n]
+		// Validate before returning a backend response to the HTTP layer. A local
+		// resolver that returns malformed or unrelated data must become 502, never
+		// a successful application/dns-message response.
+		if err := validateDNSResponse(q, response); err != nil {
+			return nil, err
+		}
 		// Copy out: the pooled buffer is reused as soon as this function returns.
-		return append([]byte(nil), (*bufp)[:n]...), nil
+		return append([]byte(nil), response...), nil
 	}
 }
 
@@ -308,20 +334,31 @@ func dnsExchangeTCP(ctx context.Context, addr string, q []byte, limits dnsTransp
 		maxFrame:   limits.maxTCPFrame,
 		maxQueries: limits.maxTCPQueries,
 	}
-	return tcpConn.exchange(ctx, q)
+	response, err := tcpConn.exchange(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateDNSResponse(q, response); err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
 func dnsExchangeWithLimits(ctx context.Context, addr string, q []byte, limits dnsTransportLimits) ([]byte, error) {
+	return dnsExchangeWithTimeout(ctx, addr, q, limits, defaultServerTimeout)
+}
+
+func dnsExchangeWithTimeout(ctx context.Context, addr string, q []byte, limits dnsTransportLimits, timeout time.Duration) ([]byte, error) {
 	if len(q) == 0 || len(q) > maxDNSPacket || len(q) > limits.maxTCPFrame {
 		return nil, errors.New("invalid DNS message size")
 	}
-	// Note: DNS query validation (minimum length, QR bit) is performed by the
-	// HTTP handler before this function is called; re-validating here would be
-	// redundant work on the hot path.
+	if timeout <= 0 {
+		timeout = defaultServerTimeout
+	}
 
 	// Keep UDP and TCP fallback inside one total budget so a failed UDP
 	// exchange cannot create a second full timeout window.
-	ctx, cancel := context.WithTimeout(ctx, dnsExchangeTimeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	// Messages larger than the configured UDP packet budget go straight to TCP.
@@ -351,6 +388,25 @@ func dnsExchangeWithLimits(ctx context.Context, addr string, q []byte, limits dn
 	}
 
 	return dnsExchangeTCP(ctx, addr, q, limits)
+}
+
+func validateDNSResponse(query, response []byte) error {
+	if len(response) < 12 {
+		return errors.New("short DNS response")
+	}
+	if len(query) < 12 {
+		return errors.New("short DNS query")
+	}
+	if response[0] != query[0] || response[1] != query[1] {
+		return errors.New("DNS response transaction ID mismatch")
+	}
+	if response[2]&0x80 == 0 {
+		return errors.New("DNS response missing QR bit")
+	}
+	if response[2]&0x78 != query[2]&0x78 {
+		return errors.New("DNS response opcode mismatch")
+	}
+	return nil
 }
 
 func upstreamReady(addr string) bool {
@@ -416,7 +472,7 @@ func effectiveDoHLimits(maxBody, maxInflight int, transport dnsTransportLimits) 
 	return maxBody, maxInflight, transport
 }
 
-func dohHandlerWithGuard(upstream, path string, maxBody, maxInflight int, transport dnsTransportLimits, guard *clientGuard, trustedProxies []netip.Prefix) http.HandlerFunc {
+func dohHandlerWithGuardTimeout(upstream, path string, maxBody, maxInflight int, transport dnsTransportLimits, guard *clientGuard, trustedProxies []netip.Prefix, serverTimeout time.Duration) http.HandlerFunc {
 	maxBody, maxInflight, transport = effectiveDoHLimits(maxBody, maxInflight, transport)
 	inflight := make(chan struct{}, maxInflight)
 	var probe readyProbe
@@ -469,15 +525,15 @@ func dohHandlerWithGuard(upstream, path string, maxBody, maxInflight int, transp
 		}
 
 		if guard != nil {
-			rateKey := clientHostKey(requestClientIP(r, trustedProxies), r.Host)
-			if !guard.beginRequest(rateKey, time.Now()) {
+			clientIP := requestClientIP(r, trustedProxies)
+			if !guard.beginRequest(clientIP, time.Now()) {
 				w.Header().Set("Retry-After", "1")
 				writeText(w, http.StatusTooManyRequests, "client rate/concurrency limit exceeded\n")
 				return
 			}
 			// Evaluate time.Now() when the request finishes, not when the
 			// defer statement is reached.
-			defer func() { guard.endRequest(rateKey, time.Now()) }()
+			defer func() { guard.endRequest(clientIP, time.Now()) }()
 		}
 
 		if r.Method != http.MethodGet && r.Method != http.MethodPost {
@@ -549,7 +605,7 @@ func dohHandlerWithGuard(upstream, path string, maxBody, maxInflight int, transp
 			}
 		}
 
-		response, err := dnsExchangeWithLimits(r.Context(), upstream, query, transport)
+		response, err := dnsExchangeWithTimeout(r.Context(), upstream, query, transport, serverTimeout)
 		if err != nil {
 			if r.Context().Err() != nil {
 				// The client disconnected; there is nobody to answer and
@@ -568,6 +624,10 @@ func dohHandlerWithGuard(upstream, path string, maxBody, maxInflight int, transp
 	}
 }
 
+func dohHandlerWithGuard(upstream, path string, maxBody, maxInflight int, transport dnsTransportLimits, guard *clientGuard, trustedProxies []netip.Prefix) http.HandlerFunc {
+	return dohHandlerWithGuardTimeout(upstream, path, maxBody, maxInflight, transport, guard, trustedProxies, defaultServerTimeout)
+}
+
 func main() {
 	port := env("PORT", "8080")
 	upstream := env("DOH_UPSTREAM_ADDR", "127.0.0.1:5300")
@@ -577,6 +637,7 @@ func main() {
 	maxConns := envInt("DOH_MAX_CONNS", defaultMaxConns, 1, maxMaxConns)
 	dohIdleTimeoutSeconds := envInt("DOH_IDLE_TIMEOUT", int(defaultDoHIdleTimeout/time.Second), 1, 3600)
 	dohIdleTimeout := time.Duration(dohIdleTimeoutSeconds) * time.Second
+	serverTimeout := serverTimeoutFromEnv()
 	transport := dnsTransportLimitsFromEnv()
 	guardConfig, err := clientGuardConfigFromEnv()
 	if err != nil {
@@ -600,7 +661,7 @@ func main() {
 	addr := net.JoinHostPort(bindHost, port)
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           dohHandlerWithGuard(upstream, path, effMaxBody, effMaxInflight, effTransport, guard, guardConfig.trustedProxyCIDRs),
+		Handler:           dohHandlerWithGuardTimeout(upstream, path, effMaxBody, effMaxInflight, effTransport, guard, guardConfig.trustedProxyCIDRs, serverTimeout),
 		ReadHeaderTimeout: httpReadTimeout,
 		ReadTimeout:       httpReadTimeout,
 		WriteTimeout:      httpWriteTimeout,
@@ -617,11 +678,11 @@ func main() {
 	log.Printf("DoH gateway listening on http://%s%s -> %s", addr, path, upstream)
 	log.Printf("health endpoints: http://%s/healthz and /readyz", addr)
 	log.Printf("limits: max %d in-flight exchanges, max %d TCP connections, max %d-byte DoH query", effMaxInflight, maxConns, effMaxBody)
-	log.Printf("abuse guard: %.3f rps (%.0f/min) / burst %d, max %d conns per source IP, %d concurrent requests per client IP+Host, rate bucket key=IP+Host, max %d client states", guardConfig.rps, guardConfig.rps*60, guardConfig.burst, guardConfig.maxIPConns, guardConfig.maxIPRequests, guardConfig.maxClientStates)
+	log.Printf("abuse guard: %.3f rps (%.0f/min) / burst %d per source IP; %.3f rps (%.0f/min) / burst %d global; max %d conns per source IP, %d concurrent requests per source IP, max %d client states", guardConfig.rateLimit, guardConfig.rateLimit*60, guardConfig.rateBurst, guardConfig.globalRateLimit, guardConfig.globalRateLimit*60, guardConfig.globalRateBurst, guardConfig.maxIPConns, guardConfig.maxIPRequests, guardConfig.maxClientStates)
 	if len(guardConfig.trustedProxyCIDRs) == 0 {
-		log.Printf("DOH_TRUSTED_PROXY_CIDRS is unset: clients are identified by the TCP peer address. Behind a reverse proxy every user then shares one rate bucket; set it to the proxy's CIDRs")
+		log.Printf("DOH_TRUSTED_PROXY_CIDRS is unset: clients are identified by the TCP peer address. Behind a reverse proxy every user then shares the same source-IP rate bucket; set it to the proxy's CIDRs")
 	}
-	log.Printf("DNS transport guard: UDP %d bytes, TCP frame %d bytes, max %d TCP queries/connection", effTransport.maxUDPPacket, effTransport.maxTCPFrame, effTransport.maxTCPQueries)
+	log.Printf("DNS transport guard: UDP %d bytes, TCP frame %d bytes, max %d TCP queries/connection, SERVER_TIMEOUT=%s", effTransport.maxUDPPacket, effTransport.maxTCPFrame, effTransport.maxTCPQueries, serverTimeout)
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
