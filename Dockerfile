@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 ARG DNSCRYPT_VERSION=2.1.18
-ARG GO_VERSION=1.27.1
+ARG GO_VERSION=1.27.0
 ARG ALPINE_VERSION=3.24.2
 
 # Build on the requested target platform and cross-compile the two static Go
@@ -14,7 +14,7 @@ ARG TARGETARCH
 WORKDIR /src
 
 RUN apk add --no-cache git ca-certificates
-RUN git clone --depth 1 --filter=blob:none --branch "${DNSCRYPT_VERSION}" \
+RUN git clone --depth 1 --branch "${DNSCRYPT_VERSION}" \
     https://github.com/DNSCrypt/dnscrypt-proxy.git .
 
 # BuildKit cache mounts affect build speed only; they are not copied into the
@@ -52,12 +52,12 @@ ENV PORT=8080 \
     DOH_UPSTREAM_ADDR=127.0.0.1:5300 \
     DOH_MAX_BODY=4096 \
     DOH_MAX_INFLIGHT=64 \
-    DOH_MAX_CONNS=96 \
-    DOH_RATE_RPS=1.6666667 \
-    DOH_RATE_BURST=80 \
+    DOH_MAX_CONNS=256 \
+    DOH_RATE_RPS=3 \
+    DOH_RATE_BURST=120 \
     DOH_MAX_IP_CONNS=32 \
     DOH_MAX_IP_REQUESTS=64 \
-    DOH_MAX_CLIENT_STATES=4096 \
+    DOH_MAX_CLIENT_STATES=8192 \
     DOH_IDLE_TIMEOUT=120 \
     DOH_MAX_UDP_PACKET=8192 \
     DOH_MAX_TCP_FRAME=8192 \
