@@ -42,12 +42,12 @@ odoh_servers = false
 http3 = false
 http3_probe = false
 
-# Upstream timeout in milliseconds. It must stay below the DoH gateway's
-# 5-second per-exchange budget (dnsExchangeTimeout): dnscrypt-proxy then gives
-# up first and answers SERVFAIL, and the client's in-flight slot is released
-# sooner during an upstream outage instead of the gateway timing out at the
-# same instant and returning HTTP 502.
-timeout = 4000
+# Upstream timeout in milliseconds. The DoH gateway enforces its own shared
+# SERVER_TIMEOUT deadline of 6 seconds for the complete local DNS exchange.
+# Keeping the resolver-side timeout below that deadline lets dnscrypt-proxy
+# return SERVFAIL during an upstream outage before the gateway has to return
+# HTTP 502 for a timed-out local exchange.
+timeout = 5000
 
 # Three long-lived upstream connections have negligible memory cost here and
 # avoid repeated TLS setup on a small CPU budget. Idle connections are kept
