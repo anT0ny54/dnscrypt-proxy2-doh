@@ -16,11 +16,11 @@ import (
 )
 
 const (
-	defaultDoHRPS          = 100.0 / 60.0 // 100 requests per 60 seconds sustained
-	defaultDoHBurst        = 80
+	defaultDoHRPS          = 3.0 // 180 requests per minute sustained per client IP + Host
+	defaultDoHBurst        = 120
 	defaultDoHIPConns      = 32
 	defaultDoHIPRequests   = 64
-	defaultDoHClientStates = 4096
+	defaultDoHClientStates = 8192
 	defaultDoHStateTTL     = 5 * time.Minute
 	defaultMaxUDPPacket    = 8 << 10
 	defaultMaxTCPFrame     = 8 << 10
@@ -29,7 +29,7 @@ const (
 	maxDoHBurst            = 256
 	maxDoHIPConns          = 32
 	maxDoHIPRequests       = 64
-	maxDoHClientStates     = 8192
+	maxDoHClientStates     = 32768
 	minDoHClientStates     = 16
 	maxDoHTransportSize    = maxDNSPacket
 	clientGuardShardCount  = 16
@@ -311,16 +311,6 @@ func (g *clientGuard) closeConnection(ip netip.Addr, now time.Time) {
 	}
 }
 
-func (g *clientGuard) stateCount() int {
-	total := 0
-	for i := range g.shards {
-		g.shards[i].mu.Lock()
-		total += len(g.shards[i].items)
-		g.shards[i].mu.Unlock()
-	}
-	return total
-}
-
 type guardListener struct {
 	net.Listener
 	guard    *clientGuard
@@ -368,7 +358,13 @@ func (l *guardListener) Accept() (net.Conn, error) {
 			_ = conn.Close()
 			continue
 		}
-		if !l.guard.openConnection(ip, now) {
+		// A configured trusted reverse proxy multiplexes many real clients over
+		// its connections, so the per-source-IP connection cap would throttle
+		// every user at once. It still counts against the global connection
+		// cap, and per-client limits are applied per request using the
+		// forwarded client IP instead.
+		tracked := !trustedProxyContains(l.guard.cfg.trustedProxyCIDRs, ip)
+		if tracked && !l.guard.openConnection(ip, now) {
 			l.releaseGlobal()
 			_ = conn.Close()
 			continue
@@ -378,6 +374,7 @@ func (l *guardListener) Accept() (net.Conn, error) {
 			Conn:          conn,
 			guard:         l.guard,
 			ip:            ip,
+			tracked:       tracked,
 			globalRelease: l.releaseGlobal,
 		}, nil
 	}
@@ -391,6 +388,7 @@ type guardConn struct {
 	net.Conn
 	guard         *clientGuard
 	ip            netip.Addr
+	tracked       bool // counted against the per-source-IP connection cap
 	globalRelease func()
 	once          sync.Once
 }
@@ -399,7 +397,9 @@ func (c *guardConn) Close() error {
 	var err error
 	c.once.Do(func() {
 		err = c.Conn.Close()
-		c.guard.closeConnection(c.ip, time.Now())
+		if c.tracked {
+			c.guard.closeConnection(c.ip, time.Now())
+		}
 		c.globalRelease()
 	})
 	return err

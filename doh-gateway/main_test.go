@@ -12,9 +12,23 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// stateCount reports the number of tracked client states. It is only needed to
+// assert the memory bound, so it lives with the tests rather than in the
+// production guard.
+func (g *clientGuard) stateCount() int {
+	total := 0
+	for i := range g.shards {
+		g.shards[i].mu.Lock()
+		total += len(g.shards[i].items)
+		g.shards[i].mu.Unlock()
+	}
+	return total
+}
 
 func TestDecodeQuery(t *testing.T) {
 	want := []byte{0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0}
@@ -96,8 +110,11 @@ func TestTunedDefaults(t *testing.T) {
 	if defaultDoHClientStates > maxDoHClientStates {
 		t.Fatalf("default client states = %d exceeds hard maximum %d", defaultDoHClientStates, maxDoHClientStates)
 	}
-	if defaultMaxInflight != 64 || defaultMaxConns != 96 {
-		t.Fatalf("public concurrency defaults = %d in-flight / %d connections, want 64 / 96", defaultMaxInflight, defaultMaxConns)
+	if defaultMaxInflight != 64 || defaultMaxConns != 256 {
+		t.Fatalf("public concurrency defaults = %d in-flight / %d connections, want 64 / 256", defaultMaxInflight, defaultMaxConns)
+	}
+	if defaultMaxConns > maxMaxConns {
+		t.Fatalf("default connections = %d exceeds hard maximum %d", defaultMaxConns, maxMaxConns)
 	}
 }
 
@@ -114,23 +131,24 @@ func TestDefaultClientGuardStartupBurstAndSustainedRate(t *testing.T) {
 	key := clientHostKey(ip, "dns.example.test")
 	t0 := time.Unix(0, 0)
 
-	if defaultDoHBurst != 80 {
-		t.Fatalf("default startup burst = %d, want 80", defaultDoHBurst)
+	if defaultDoHBurst != 120 {
+		t.Fatalf("default startup burst = %d, want 120", defaultDoHBurst)
 	}
-	for i := 0; i < 80; i++ {
+	for i := 0; i < defaultDoHBurst; i++ {
 		if !g.beginRequest(key, t0) {
 			t.Fatalf("startup burst request %d was rejected", i+1)
 		}
 		g.endRequest(key, t0)
 	}
 	if g.beginRequest(key, t0) {
-		t.Fatal("request beyond the 80-request startup burst was accepted immediately")
+		t.Fatalf("request beyond the %d-request startup burst was accepted immediately", defaultDoHBurst)
 	}
 
-	// At exactly 100 requests / 60 seconds, one token refills every 600ms.
-	refillAt := t0.Add(600 * time.Millisecond)
+	// One token refills every 1/defaultDoHRPS seconds (about 333ms at 3 rps).
+	rps := defaultDoHRPS
+	refillAt := t0.Add(time.Duration(float64(time.Second)/rps) + 10*time.Millisecond)
 	if !g.beginRequest(key, refillAt) {
-		t.Fatal("one-token sustained refill after 600ms was rejected")
+		t.Fatal("one-token sustained refill was rejected")
 	}
 	g.endRequest(key, refillAt)
 }
@@ -816,5 +834,162 @@ func TestReadyEndpointUnavailable(t *testing.T) {
 	}
 	if got := rec.Body.String(); got != "upstream unavailable\n" {
 		t.Fatalf("readyz body = %q, want %q", got, "upstream unavailable\n")
+	}
+}
+
+func TestGuardListenerTrustedProxyIsExemptFromPerIPConnectionCap(t *testing.T) {
+	base, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard := newClientGuard(clientGuardConfig{
+		rps:               10,
+		burst:             10,
+		maxIPConns:        1,
+		maxIPRequests:     4,
+		maxClientStates:   16,
+		stateTTL:          5 * time.Minute,
+		trustedProxyCIDRs: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")},
+	})
+	ln := newGuardListener(base, guard, 8)
+	defer ln.Close()
+
+	// A rejected connection would make Accept loop until this deadline.
+	if err := base.(*net.TCPListener).SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		client, err := net.Dial("tcp", base.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		accepted, err := ln.Accept()
+		if err != nil {
+			t.Fatalf("trusted proxy connection %d was rejected: %v", i+1, err)
+		}
+		defer accepted.Close()
+	}
+}
+
+func TestGuardListenerEnforcesPerIPConnectionCapForUntrustedPeers(t *testing.T) {
+	base, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard := newClientGuard(clientGuardConfig{
+		rps:             10,
+		burst:           10,
+		maxIPConns:      1,
+		maxIPRequests:   4,
+		maxClientStates: 16,
+		stateTTL:        5 * time.Minute,
+	})
+	ln := newGuardListener(base, guard, 8)
+	defer ln.Close()
+
+	first, err := net.Dial("tcp", base.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	firstAccepted, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := net.Dial("tcp", base.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	// The second connection from the same IP is closed inside Accept, which
+	// then keeps waiting; the listener deadline ends that wait.
+	if err := base.(*net.TCPListener).SetDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if conn, err := ln.Accept(); err == nil {
+		conn.Close()
+		t.Fatal("second connection from the same untrusted IP was accepted")
+	}
+
+	// Closing the first connection releases the per-IP slot.
+	_ = firstAccepted.Close()
+	if err := base.(*net.TCPListener).SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	third, err := net.Dial("tcp", base.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer third.Close()
+	thirdAccepted, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("connection after releasing the per-IP slot was rejected: %v", err)
+	}
+	_ = thirdAccepted.Close()
+}
+
+func TestEnvFloatRejectsNaN(t *testing.T) {
+	t.Setenv("DOH_TEST_FLOAT", "NaN")
+	if got := envFloat("DOH_TEST_FLOAT", 2.5, 0.1, 100); got != 2.5 {
+		t.Fatalf("envFloat(NaN) = %v, want fallback 2.5", got)
+	}
+	t.Setenv("DOH_TEST_FLOAT", "Inf")
+	if got := envFloat("DOH_TEST_FLOAT", 2.5, 0.1, 100); got != 100 {
+		t.Fatalf("envFloat(Inf) = %v, want clamp 100", got)
+	}
+}
+
+func TestEnvIntTrimsWhitespaceAndClamps(t *testing.T) {
+	t.Setenv("DOH_TEST_INT", " 42 ")
+	if got := envInt("DOH_TEST_INT", 7, 1, 100); got != 42 {
+		t.Fatalf("envInt(\" 42 \") = %d, want 42", got)
+	}
+	t.Setenv("DOH_TEST_INT", "99999999999999999999")
+	if got := envInt("DOH_TEST_INT", 7, 1, 100); got != 100 {
+		t.Fatalf("envInt(overflow) = %d, want clamp 100", got)
+	}
+	t.Setenv("DOH_TEST_INT", "-5")
+	if got := envInt("DOH_TEST_INT", 7, 1, 100); got != 7 {
+		t.Fatalf("envInt(-5) = %d, want fallback 7", got)
+	}
+	t.Setenv("DOH_TEST_INT", "0")
+	if got := envInt("DOH_TEST_INT", 7, 1, 100); got != 7 {
+		t.Fatalf("envInt(0) = %d, want fallback 7", got)
+	}
+}
+
+func TestReadyEndpointCachesProbe(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	var accepts atomic.Int32
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepts.Add(1)
+			_ = conn.Close()
+		}
+	}()
+
+	h := dohHandlerWithGuard(ln.Addr().String(), "/dns-query", maxDNSPacket, 1, defaultDNSTransportLimits(), nil, nil)
+	for i := 0; i < 5; i++ {
+		rec := httptest.NewRecorder()
+		h(rec, httptest.NewRequest("GET", "/readyz", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("readyz call %d status = %d, want %d", i+1, rec.Code, http.StatusOK)
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := accepts.Load(); got != 1 {
+		t.Fatalf("5 /readyz calls within the cache TTL opened %d upstream connections, want 1", got)
 	}
 }

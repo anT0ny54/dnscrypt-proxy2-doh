@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -35,9 +36,9 @@ const (
 
 	defaultMaxBody        = 4 << 10 // 4 KiB request query limit
 	defaultMaxInflight    = 64
-	defaultMaxConns       = 96
+	defaultMaxConns       = 256
 	maxMaxInflight        = 64
-	maxMaxConns           = 256
+	maxMaxConns           = 1024
 	defaultDoHIdleTimeout = 120 * time.Second
 
 	// headerOverhead budgets for the request line/method/host and the fixed
@@ -46,6 +47,11 @@ const (
 	headerOverhead = 2 << 10 // 2 KiB
 
 	readyProbeTimeout = 500 * time.Millisecond
+
+	// readyCacheTTL coalesces /readyz probes. /readyz is reachable without the
+	// per-client guard, so without a short cache every request would open a
+	// fresh TCP connection to the local resolver.
+	readyCacheTTL = time.Second
 )
 
 // Pre-computed health endpoint bodies: avoids a string-to-[]byte conversion
@@ -73,12 +79,12 @@ func env(key, fallback string) string {
 	return fallback
 }
 
-// envInt parses the same unsigned-decimal syntax used by start.sh:
-// non-empty ASCII digits only, no trimming or leading '+'. Values below min
-// fall back to the default, while values above max (including integer
-// overflow) clamp to max.
+// envInt parses an unsigned decimal: surrounding whitespace is ignored, the
+// rest must be non-empty ASCII digits (no sign). Values below min fall back to
+// the default, while values above max (including integer overflow) clamp to
+// max.
 func envInt(key string, fallback, min, max int) int {
-	v := os.Getenv(key)
+	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {
 		return fallback
 	}
@@ -114,7 +120,9 @@ func envFloat(key string, fallback, min, max float64) float64 {
 		return fallback
 	}
 	n, err := strconv.ParseFloat(v, 64)
-	if err != nil || n < min {
+	// NaN compares false against every bound and would silently disable the
+	// token bucket (NaN < 1 is false), so it must be rejected explicitly.
+	if err != nil || math.IsNaN(n) || n < min {
 		return fallback
 	}
 	if n > max {
@@ -354,6 +362,25 @@ func upstreamReady(addr string) bool {
 	return true
 }
 
+// readyProbe caches the result of upstreamReady for readyCacheTTL. The mutex
+// is held across the probe so concurrent /readyz requests share one dial.
+type readyProbe struct {
+	mu sync.Mutex
+	at time.Time
+	ok bool
+}
+
+func (p *readyProbe) ready(addr string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.at.IsZero() && time.Since(p.at) < readyCacheTTL {
+		return p.ok
+	}
+	p.ok = upstreamReady(addr)
+	p.at = time.Now()
+	return p.ok
+}
+
 // writeText writes a plain-text status response. Content-Type is set here,
 // before WriteHeader, because every call site is an error/status path with
 // no other opportunity to set it: once WriteHeader runs, net/http's
@@ -392,6 +419,7 @@ func effectiveDoHLimits(maxBody, maxInflight int, transport dnsTransportLimits) 
 func dohHandlerWithGuard(upstream, path string, maxBody, maxInflight int, transport dnsTransportLimits, guard *clientGuard, trustedProxies []netip.Prefix) http.HandlerFunc {
 	maxBody, maxInflight, transport = effectiveDoHLimits(maxBody, maxInflight, transport)
 	inflight := make(chan struct{}, maxInflight)
+	var probe readyProbe
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -406,7 +434,7 @@ func dohHandlerWithGuard(upstream, path string, maxBody, maxInflight int, transp
 
 		if r.URL.Path == "/readyz" {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			if upstreamReady(upstream) {
+			if probe.ready(upstream) {
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write(readyzBody)
 				return
@@ -440,16 +468,16 @@ func dohHandlerWithGuard(upstream, path string, maxBody, maxInflight int, transp
 			return
 		}
 
-		var sourceIP netip.Addr
 		if guard != nil {
-			sourceIP = requestClientIP(r, trustedProxies)
-			rateKey := clientHostKey(sourceIP, r.Host)
+			rateKey := clientHostKey(requestClientIP(r, trustedProxies), r.Host)
 			if !guard.beginRequest(rateKey, time.Now()) {
 				w.Header().Set("Retry-After", "1")
 				writeText(w, http.StatusTooManyRequests, "client rate/concurrency limit exceeded\n")
 				return
 			}
-			defer guard.endRequest(rateKey, time.Now())
+			// Evaluate time.Now() when the request finishes, not when the
+			// defer statement is reached.
+			defer func() { guard.endRequest(rateKey, time.Now()) }()
 		}
 
 		if r.Method != http.MethodGet && r.Method != http.MethodPost {
@@ -559,6 +587,7 @@ func main() {
 		path = "/" + path
 	}
 	if path == "/" || path == "/healthz" || path == "/readyz" {
+		log.Printf("DOH_PATH %q is reserved; using /dns-query", path)
 		path = "/dns-query"
 	}
 
@@ -586,9 +615,12 @@ func main() {
 	ln = newGuardListener(ln, guard, maxConns)
 
 	log.Printf("DoH gateway listening on http://%s%s -> %s", addr, path, upstream)
-	log.Printf("health endpoints: http://%s/healthz and /readyz", net.JoinHostPort(bindHost, port))
+	log.Printf("health endpoints: http://%s/healthz and /readyz", addr)
 	log.Printf("limits: max %d in-flight exchanges, max %d TCP connections, max %d-byte DoH query", effMaxInflight, maxConns, effMaxBody)
-	log.Printf("abuse guard: %.3f rps (100/60s) / burst %d, max %d conns + %d concurrent requests per client IP, rate bucket key=IP+Host, max %d client states", guardConfig.rps, guardConfig.burst, guardConfig.maxIPConns, guardConfig.maxIPRequests, guardConfig.maxClientStates)
+	log.Printf("abuse guard: %.3f rps (%.0f/min) / burst %d, max %d conns per source IP, %d concurrent requests per client IP+Host, rate bucket key=IP+Host, max %d client states", guardConfig.rps, guardConfig.rps*60, guardConfig.burst, guardConfig.maxIPConns, guardConfig.maxIPRequests, guardConfig.maxClientStates)
+	if len(guardConfig.trustedProxyCIDRs) == 0 {
+		log.Printf("DOH_TRUSTED_PROXY_CIDRS is unset: clients are identified by the TCP peer address. Behind a reverse proxy every user then shares one rate bucket; set it to the proxy's CIDRs")
+	}
 	log.Printf("DNS transport guard: UDP %d bytes, TCP frame %d bytes, max %d TCP queries/connection", effTransport.maxUDPPacket, effTransport.maxTCPFrame, effTransport.maxTCPQueries)
 
 	serveErr := make(chan error, 1)
