@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 
 ARG DNSCRYPT_VERSION=2.1.18
-ARG GO_VERSION=1.27.0
-ARG ALPINE_VERSION=3.24.2
+ARG GO_VERSION=1.27
+ARG ALPINE_VERSION=3.24
 
 # Build on the requested target platform and cross-compile the two static Go
 # binaries. The Go patch version and dnscrypt-proxy release are pinned.
