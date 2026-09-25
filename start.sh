@@ -9,16 +9,14 @@ dns_listen=127.0.0.1:5300
 port="${PORT:-8080}"
 doh_path="${DOH_PATH:-/dns-query}"
 doh_bind="${DOH_BIND:-0.0.0.0}"
-dnscrypt_gomemlimit="${DNSCRYPT_GOMEMLIMIT:-288MiB}"
-doh_gomemlimit="${DOH_GOMEMLIMIT:-80MiB}"
+dnscrypt_gomemlimit="${DNSCRYPT_GOMEMLIMIT:-256MiB}"
+doh_gomemlimit="${DOH_GOMEMLIMIT:-64MiB}"
 public_doh_url="${PUBLIC_DOH_URL:-}"
-doh_upstream="${DOH_UPSTREAM_ADDR:-$dns_listen}"
 
-# dnscrypt-proxy's max_clients is fixed at 64 in the checked-in config.
-# The gateway's DOH_MAX_INFLIGHT is hard-capped at the same 64, so the
-# resolver always has at least as much local concurrency available as the
-# gateway can admit. Keeping the config immutable avoids rewriting a file in
-# the image at startup and keeps the unprivileged container filesystem safe.
+# dnscrypt-proxy's max_clients is fixed at 64 in the checked-in config and the
+# gateway's DOH_MAX_INFLIGHT is hard-capped at the same 64. The resolver address
+# is fixed at 127.0.0.1:5300 so runtime variables cannot introduce another DNS
+# path or hostname resolution outside dnscrypt-proxy.
 
 # Validate the immutable checked-in configuration before starting either service.
 echo "Checking dnscrypt-proxy configuration..."
@@ -31,7 +29,7 @@ echo "Starting dnscrypt-proxy 2 + DoH gateway"
 echo "  dnscrypt-proxy : $dns_listen (max_clients=64; gateway DOH_MAX_INFLIGHT is capped at 64)"
 echo "  resolvers      : HaGeZiDNS1, HaGeZiDNS2, HaGeZiDNS3 (static)"
 echo "  DoH endpoint   : ${doh_bind}:$port$doh_path"
-echo "  memory target  : ${dnscrypt_gomemlimit} dnscrypt-proxy + ${doh_gomemlimit} doh-gateway"
+echo "  memory targets : ${dnscrypt_gomemlimit} dnscrypt-proxy + ${doh_gomemlimit} doh-gateway"
 echo "  CPU target     : 0.25 vCPU (GOMAXPROCS=${GOMAXPROCS:-1})"
 if [ -n "$public_doh_url" ]; then
     echo "  Public DoH URL : $public_doh_url"
@@ -95,7 +93,6 @@ dns_pid=$!
 # image free of an external netcat dependency. /readyz returns 503 until the
 # local dnscrypt-proxy listener is reachable.
 GOMEMLIMIT="$doh_gomemlimit" \
-    DOH_UPSTREAM_ADDR="$doh_upstream" \
     "$DOH_BIN" &
 doh_pid=$!
 
