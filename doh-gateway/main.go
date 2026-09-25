@@ -131,20 +131,6 @@ func envFloat(key string, fallback, min, max float64) float64 {
 	return n
 }
 
-func envFloatAlias(primary, legacy string, fallback, min, max float64) float64 {
-	if strings.TrimSpace(os.Getenv(primary)) != "" {
-		return envFloat(primary, fallback, min, max)
-	}
-	return envFloat(legacy, fallback, min, max)
-}
-
-func envIntAlias(primary, legacy string, fallback, min, max int) int {
-	if strings.TrimSpace(os.Getenv(primary)) != "" {
-		return envInt(primary, fallback, min, max)
-	}
-	return envInt(legacy, fallback, min, max)
-}
-
 func serverTimeoutFromEnv() time.Duration {
 	seconds := envInt("SERVER_TIMEOUT", int(defaultServerTimeout/time.Second), 1, 60)
 	return time.Duration(seconds) * time.Second

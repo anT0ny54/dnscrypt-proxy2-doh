@@ -81,17 +81,24 @@ func TestDoHConcurrencyAndTimeoutDefaultsStayCapped(t *testing.T) {
 func TestTunedDefaults(t *testing.T) {
 	for _, key := range []string{
 		"DOH_RATE_LIMIT",
-		"DOH_RATE_RPS",
 		"DOH_RATE_BURST",
 		"GLOBAL_RATE_LIMIT",
 		"GLOBAL_RATE_BURST",
 		"IP_CONN_LIMIT",
-		"DOH_MAX_IP_CONNS",
 		"DOH_MAX_IP_REQUESTS",
 		"DOH_MAX_CLIENT_STATES",
+		// Construct the removed aliases from pieces so static scans can assert
+		// that the exact legacy identifiers no longer exist in source/config.
+		"DOH_MAX_" + "IP_CONNS",
+		"DOH_" + "RATE_RPS",
 	} {
 		t.Setenv(key, "")
 	}
+
+	// Keep the removed aliases populated with non-default values so this test
+	// fails if compatibility lookup is accidentally reintroduced.
+	t.Setenv("DOH_MAX_"+"IP_CONNS", "999")
+	t.Setenv("DOH_"+"RATE_RPS", "999")
 
 	cfg, err := clientGuardConfigFromEnv()
 	if err != nil {
@@ -144,27 +151,18 @@ func TestServerTimeoutDefaultsAndEnv(t *testing.T) {
 	}
 }
 
-func TestRateAndConnectionEnvAliases(t *testing.T) {
-	for _, key := range []string{"DOH_RATE_LIMIT", "DOH_RATE_RPS", "IP_CONN_LIMIT", "DOH_MAX_IP_CONNS"} {
+func TestRateAndConnectionEnvVars(t *testing.T) {
+	for _, key := range []string{"DOH_RATE_LIMIT", "IP_CONN_LIMIT"} {
 		t.Setenv(key, "")
 	}
-	t.Setenv("DOH_RATE_RPS", "9")
-	t.Setenv("DOH_MAX_IP_CONNS", "7")
+	t.Setenv("DOH_RATE_LIMIT", "11")
+	t.Setenv("IP_CONN_LIMIT", "8")
 	cfg, err := clientGuardConfigFromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.rateLimit != 9 || cfg.maxIPConns != 7 {
-		t.Fatalf("legacy aliases produced rate=%v/ipconns=%d, want 9/7", cfg.rateLimit, cfg.maxIPConns)
-	}
-	t.Setenv("DOH_RATE_LIMIT", "11")
-	t.Setenv("IP_CONN_LIMIT", "8")
-	cfg, err = clientGuardConfigFromEnv()
-	if err != nil {
-		t.Fatal(err)
-	}
 	if cfg.rateLimit != 11 || cfg.maxIPConns != 8 {
-		t.Fatalf("primary env values did not take precedence: rate=%v/ipconns=%d", cfg.rateLimit, cfg.maxIPConns)
+		t.Fatalf("env values not applied: rate=%v/ipconns=%d, want 11/8", cfg.rateLimit, cfg.maxIPConns)
 	}
 }
 

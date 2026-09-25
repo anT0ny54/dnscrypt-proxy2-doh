@@ -75,11 +75,11 @@ type clientGuardConfig struct {
 }
 
 func clientGuardConfigFromEnv() (clientGuardConfig, error) {
-	rateLimit := envFloatAlias("DOH_RATE_LIMIT", "DOH_RATE_RPS", defaultDoHRateLimit, 0.1, maxDoHRateLimit)
+	rateLimit := envFloat("DOH_RATE_LIMIT", defaultDoHRateLimit, 0.1, maxDoHRateLimit)
 	rateBurst := envInt("DOH_RATE_BURST", defaultDoHRateBurst, 1, maxDoHRateBurst)
 	globalRateLimit := envFloat("GLOBAL_RATE_LIMIT", defaultGlobalRateLimit, 0.1, maxGlobalRateLimit)
 	globalRateBurst := envInt("GLOBAL_RATE_BURST", defaultGlobalRateBurst, 1, maxGlobalRateBurst)
-	maxIPConns := envIntAlias("IP_CONN_LIMIT", "DOH_MAX_IP_CONNS", defaultIPConnLimit, 1, maxIPConnLimit)
+	maxIPConns := envInt("IP_CONN_LIMIT", defaultIPConnLimit, 1, maxIPConnLimit)
 	maxIPRequests := envInt("DOH_MAX_IP_REQUESTS", defaultDoHIPRequests, 1, maxDoHIPRequests)
 	maxStates := envInt("DOH_MAX_CLIENT_STATES", defaultDoHClientStates, minDoHClientStates, maxDoHClientStates)
 	maxStates = (maxStates / clientGuardShardCount) * clientGuardShardCount
