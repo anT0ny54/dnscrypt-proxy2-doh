@@ -61,6 +61,12 @@ func TestValidateDNSQuery(t *testing.T) {
 	}
 }
 
+func TestFixedDNSUpstream(t *testing.T) {
+	if fixedDNSUpstream != "127.0.0.1:5300" {
+		t.Fatalf("fixed DNS upstream = %q, want 127.0.0.1:5300", fixedDNSUpstream)
+	}
+}
+
 func TestDoHConcurrencyAndTimeoutDefaultsStayCapped(t *testing.T) {
 	transport := defaultDNSTransportLimits()
 
@@ -79,42 +85,9 @@ func TestDoHConcurrencyAndTimeoutDefaultsStayCapped(t *testing.T) {
 }
 
 func TestTunedDefaults(t *testing.T) {
-	for _, key := range []string{
-		"DOH_RATE_LIMIT",
-		"DOH_RATE_BURST",
-		"GLOBAL_RATE_LIMIT",
-		"GLOBAL_RATE_BURST",
-		"IP_CONN_LIMIT",
-		"DOH_MAX_IP_REQUESTS",
-		"DOH_MAX_CLIENT_STATES",
-		// Construct the removed aliases from pieces so static scans can assert
-		// that the exact legacy identifiers no longer exist in source/config.
-		"DOH_MAX_" + "IP_CONNS",
-		"DOH_" + "RATE_RPS",
-	} {
-		t.Setenv(key, "")
-	}
-
-	// Keep the removed aliases populated with non-default values so this test
-	// fails if compatibility lookup is accidentally reintroduced.
-	t.Setenv("DOH_MAX_"+"IP_CONNS", "999")
-	t.Setenv("DOH_"+"RATE_RPS", "999")
-
 	cfg, err := clientGuardConfigFromEnv()
 	if err != nil {
 		t.Fatalf("clientGuardConfigFromEnv() error = %v", err)
-	}
-	if cfg.rateLimit != defaultDoHRateLimit {
-		t.Fatalf("default DoH rate limit = %v, want %v", cfg.rateLimit, defaultDoHRateLimit)
-	}
-	if cfg.rateBurst != defaultDoHRateBurst {
-		t.Fatalf("default DoH rate burst = %d, want %d", cfg.rateBurst, defaultDoHRateBurst)
-	}
-	if cfg.globalRateLimit != defaultGlobalRateLimit {
-		t.Fatalf("default global rate limit = %v, want %v", cfg.globalRateLimit, defaultGlobalRateLimit)
-	}
-	if cfg.globalRateBurst != defaultGlobalRateBurst {
-		t.Fatalf("default global rate burst = %d, want %d", cfg.globalRateBurst, defaultGlobalRateBurst)
 	}
 	if cfg.maxIPConns != defaultIPConnLimit {
 		t.Fatalf("default per-IP connections = %d, want %d", cfg.maxIPConns, defaultIPConnLimit)
@@ -125,14 +98,27 @@ func TestTunedDefaults(t *testing.T) {
 	if cfg.maxClientStates != defaultDoHClientStates {
 		t.Fatalf("default client states = %d, want %d", cfg.maxClientStates, defaultDoHClientStates)
 	}
-	if defaultDoHClientStates > maxDoHClientStates {
-		t.Fatalf("default client states = %d exceeds hard maximum %d", defaultDoHClientStates, maxDoHClientStates)
+	if defaultIPConnLimit != 16 || defaultDoHIPRequests != 16 {
+		t.Fatalf("public per-client defaults = %d connections / %d requests, want 16 / 16", defaultIPConnLimit, defaultDoHIPRequests)
 	}
-	if defaultMaxInflight != 64 || defaultMaxConns != 256 {
-		t.Fatalf("public concurrency defaults = %d in-flight / %d connections, want 64 / 256", defaultMaxInflight, defaultMaxConns)
+	if defaultMaxInflight != 64 || defaultMaxConns != 512 {
+		t.Fatalf("public concurrency defaults = %d in-flight / %d connections, want 64 / 512", defaultMaxInflight, defaultMaxConns)
 	}
 	if defaultMaxConns > maxMaxConns {
 		t.Fatalf("default connections = %d exceeds hard maximum %d", defaultMaxConns, maxMaxConns)
+	}
+}
+
+func TestBindHostRejectsHostname(t *testing.T) {
+	t.Setenv("DOH_BIND", "localhost")
+	if _, err := bindHostFromEnv(); err == nil {
+		t.Fatal("hostname DOH_BIND was accepted; binding must not perform hostname resolution")
+	}
+
+	t.Setenv("DOH_BIND", "127.0.0.1")
+	got, err := bindHostFromEnv()
+	if err != nil || got != "127.0.0.1" {
+		t.Fatalf("IPv4 DOH_BIND = %q, err=%v", got, err)
 	}
 }
 
@@ -151,69 +137,29 @@ func TestServerTimeoutDefaultsAndEnv(t *testing.T) {
 	}
 }
 
-func TestRateAndConnectionEnvVars(t *testing.T) {
-	for _, key := range []string{"DOH_RATE_LIMIT", "IP_CONN_LIMIT"} {
+func TestGuardEnvVars(t *testing.T) {
+	for _, key := range []string{"IP_CONN_LIMIT", "DOH_MAX_IP_REQUESTS", "DOH_MAX_CLIENT_STATES"} {
 		t.Setenv(key, "")
 	}
-	t.Setenv("DOH_RATE_LIMIT", "11")
 	t.Setenv("IP_CONN_LIMIT", "8")
+	t.Setenv("DOH_MAX_IP_REQUESTS", "12")
+	t.Setenv("DOH_MAX_CLIENT_STATES", "34")
 	cfg, err := clientGuardConfigFromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.rateLimit != 11 || cfg.maxIPConns != 8 {
-		t.Fatalf("env values not applied: rate=%v/ipconns=%d, want 11/8", cfg.rateLimit, cfg.maxIPConns)
+	if cfg.maxIPConns != 8 || cfg.maxIPRequests != 12 || cfg.maxClientStates != 32 {
+		t.Fatalf("guard env values not applied: conns=%d requests=%d states=%d, want 8/12/32", cfg.maxIPConns, cfg.maxIPRequests, cfg.maxClientStates)
 	}
 }
 
-func TestDefaultClientGuardStartupBurstAndSustainedRate(t *testing.T) {
+func TestClientGuardConcurrencyAndConnections(t *testing.T) {
 	g := newClientGuard(clientGuardConfig{
-		rateLimit:       defaultDoHRateLimit,
-		rateBurst:       defaultDoHRateBurst,
-		globalRateLimit: defaultGlobalRateLimit,
-		globalRateBurst: defaultGlobalRateBurst,
-		maxIPConns:      defaultIPConnLimit,
-		maxIPRequests:   defaultDoHIPRequests,
-		maxClientStates: 16,
-		stateTTL:        defaultDoHStateTTL,
-	})
-	ip := netip.MustParseAddr("198.51.100.31")
-	t0 := time.Unix(0, 0)
-
-	if defaultDoHRateBurst != 200 {
-		t.Fatalf("default startup burst = %d, want 200", defaultDoHRateBurst)
-	}
-	for i := 0; i < defaultDoHRateBurst; i++ {
-		if !g.beginRequest(ip, t0) {
-			t.Fatalf("startup burst request %d was rejected", i+1)
-		}
-		g.endRequest(ip, t0)
-	}
-	if g.beginRequest(ip, t0) {
-		t.Fatalf("request beyond the %d-request startup burst was accepted immediately", defaultDoHRateBurst)
-	}
-
-	// One token refills every 1/defaultDoHRateLimit seconds (about 333ms at 3 rps).
-	rps := defaultDoHRateLimit
-	refillAt := t0.Add(time.Duration(float64(time.Second)/rps) + 10*time.Millisecond)
-	if !g.beginRequest(ip, refillAt) {
-		t.Fatal("one-token sustained refill was rejected")
-	}
-	g.endRequest(ip, refillAt)
-}
-
-func TestClientGuardRateAndConcurrency(t *testing.T) {
-	cfg := clientGuardConfig{
-		rateLimit:       1,
-		rateBurst:       2,
-		globalRateLimit: 100,
-		globalRateBurst: 100,
 		maxIPConns:      1,
 		maxIPRequests:   1,
 		maxClientStates: 16,
 		stateTTL:        5 * time.Minute,
-	}
-	g := newClientGuard(cfg)
+	})
 	ip := netip.MustParseAddr("198.51.100.10")
 	t0 := time.Unix(0, 0)
 
@@ -225,16 +171,9 @@ func TestClientGuardRateAndConcurrency(t *testing.T) {
 	}
 	g.endRequest(ip, t0)
 	if !g.beginRequest(ip, t0) {
-		t.Fatal("second request should consume the burst token")
+		t.Fatal("request after releasing per-IP slot was rejected")
 	}
 	g.endRequest(ip, t0)
-	if g.beginRequest(ip, t0) {
-		t.Fatal("token bucket allowed a third immediate request")
-	}
-	if !g.beginRequest(ip, t0.Add(time.Second)) {
-		t.Fatal("token bucket did not refill after one second")
-	}
-	g.endRequest(ip, t0.Add(time.Second))
 
 	if !g.openConnection(ip, t0) {
 		t.Fatal("first connection was rejected")
@@ -243,83 +182,36 @@ func TestClientGuardRateAndConcurrency(t *testing.T) {
 		t.Fatal("per-IP connection limit was not enforced")
 	}
 	g.closeConnection(ip, t0)
+	if !g.openConnection(ip, t0) {
+		t.Fatal("connection after releasing per-IP slot was rejected")
+	}
+	g.closeConnection(ip, t0)
 }
 
-func TestClientGuardRateIsPerIPOnly(t *testing.T) {
-	cfg := clientGuardConfig{
-		rateLimit:       1,
-		rateBurst:       1,
-		globalRateLimit: 100,
-		globalRateBurst: 100,
-		maxIPConns:      1,
-		maxIPRequests:   8,
-		maxClientStates: 32,
-		stateTTL:        5 * time.Minute,
-	}
-	g := newClientGuard(cfg)
-	ip := netip.MustParseAddr("198.51.100.30")
-	now := time.Unix(0, 0)
-
-	if !g.beginRequest(ip, now) {
-		t.Fatal("first request was rejected")
-	}
-	g.endRequest(ip, now)
-	if g.beginRequest(ip, now) {
-		t.Fatal("second immediate request from the same source IP should be rejected")
-	}
-
-	// Host values are intentionally ignored. A caller changing Host must not
-	// receive a second rate bucket.
-	if g.beginRequest(ip, now) {
-		t.Fatal("changing Host must not bypass the source-IP rate bucket")
-	}
-
-	if !g.openConnection(ip, now) {
-		t.Fatal("first per-IP connection was rejected")
-	}
-	if g.openConnection(ip, now) {
-		t.Fatal("per-IP connection cap was not enforced")
-	}
-	g.closeConnection(ip, now)
-}
-
-func TestClientGuardGlobalRate(t *testing.T) {
+func TestClientGuardAllowsBurstUpToConcurrencyCap(t *testing.T) {
 	g := newClientGuard(clientGuardConfig{
-		rateLimit:       100,
-		rateBurst:       100,
-		globalRateLimit: 1,
-		globalRateBurst: 2,
 		maxIPConns:      8,
 		maxIPRequests:   8,
-		maxClientStates: 32,
+		maxClientStates: 16,
 		stateTTL:        5 * time.Minute,
 	})
+	ip := netip.MustParseAddr("198.51.100.30")
 	now := time.Unix(0, 0)
-	ip1 := netip.MustParseAddr("198.51.100.31")
-	ip2 := netip.MustParseAddr("198.51.100.32")
-	ip3 := netip.MustParseAddr("198.51.100.33")
-
-	for _, ip := range []netip.Addr{ip1, ip2} {
+	for i := 0; i < 8; i++ {
 		if !g.beginRequest(ip, now) {
-			t.Fatalf("global burst request from %s was rejected", ip)
+			t.Fatalf("request %d was rejected before the per-IP concurrency cap", i+1)
 		}
+	}
+	if g.beginRequest(ip, now) {
+		t.Fatal("request beyond the per-IP concurrency cap was accepted")
+	}
+	for i := 0; i < 8; i++ {
 		g.endRequest(ip, now)
 	}
-	if g.beginRequest(ip3, now) {
-		t.Fatal("request beyond the global burst was accepted")
-	}
-	if !g.beginRequest(ip3, now.Add(time.Second)) {
-		t.Fatal("global rate limiter did not refill after one second")
-	}
-	g.endRequest(ip3, now.Add(time.Second))
 }
 
 func TestClientGuardStateIsBounded(t *testing.T) {
 	cfg := clientGuardConfig{
-		rateLimit:       10,
-		rateBurst:       10,
-		globalRateLimit: 1000,
-		globalRateBurst: 1000,
 		maxIPConns:      1,
 		maxIPRequests:   1,
 		maxClientStates: 16,
@@ -331,8 +223,6 @@ func TestClientGuardStateIsBounded(t *testing.T) {
 	for i := 0; i < 5000; i++ {
 		ip := netip.AddrFrom4([4]byte{198, 51, byte(i >> 8), byte(i)})
 		if !g.beginRequest(ip, now) {
-			// A shard can be temporarily full of the same active entry, but the
-			// request is immediately released in this test so state remains bounded.
 			continue
 		}
 		g.endRequest(ip, now)
@@ -344,10 +234,6 @@ func TestClientGuardStateIsBounded(t *testing.T) {
 
 func TestDefaultClientGuardStateIsBounded(t *testing.T) {
 	cfg := clientGuardConfig{
-		rateLimit:       defaultDoHRateLimit,
-		rateBurst:       defaultDoHRateBurst,
-		globalRateLimit: defaultGlobalRateLimit,
-		globalRateBurst: defaultGlobalRateBurst,
 		maxIPConns:      defaultIPConnLimit,
 		maxIPRequests:   defaultDoHIPRequests,
 		maxClientStates: defaultDoHClientStates,
@@ -374,10 +260,6 @@ func TestGuardListenerImmediateCloseWhenGlobalFull(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := clientGuardConfig{
-		rateLimit:       10,
-		rateBurst:       10,
-		globalRateLimit: 1000,
-		globalRateBurst: 1000,
 		maxIPConns:      4,
 		maxIPRequests:   4,
 		maxClientStates: 16,
@@ -928,7 +810,7 @@ func TestDoHHandlerGetAndPost(t *testing.T) {
 	}
 }
 
-func TestDoHHandlerAppliesClientGuard(t *testing.T) {
+func TestDoHHandlerAppliesPerIPConcurrencyCap(t *testing.T) {
 	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
 	if err != nil {
 		t.Fatal(err)
@@ -937,54 +819,54 @@ func TestDoHHandlerAppliesClientGuard(t *testing.T) {
 	addr := udp.LocalAddr().String()
 
 	query := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	requestSeen := make(chan struct{})
 	go func() {
-		for range 2 {
-			buf := make([]byte, maxDNSPacket)
-			n, client, err := udp.ReadFromUDP(buf)
-			if err != nil {
-				return
-			}
-			buf[2] |= 0x80
-			_, _ = udp.WriteToUDP(buf[:n], client)
+		buf := make([]byte, maxDNSPacket)
+		_, _, err := udp.ReadFromUDP(buf)
+		if err == nil {
+			close(requestSeen)
 		}
 	}()
 
 	guard := newClientGuard(clientGuardConfig{
-		rateLimit:       1,
-		rateBurst:       1,
-		globalRateLimit: 100,
-		globalRateBurst: 100,
 		maxIPConns:      8,
-		maxIPRequests:   8,
+		maxIPRequests:   1,
 		maxClientStates: 16,
 		stateTTL:        5 * time.Minute,
 	})
-	h := dohHandlerWithGuard(addr, "/dns-query", maxDNSPacket, 1, defaultDNSTransportLimits(), guard, nil)
+	h := dohHandlerWithGuardTimeout(addr, "/dns-query", maxDNSPacket, 2, defaultDNSTransportLimits(), guard, nil, 5*time.Second)
+
 	encoded := base64.RawURLEncoding.EncodeToString(query)
+	ctx, cancel := context.WithCancel(context.Background())
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		req := httptest.NewRequest(http.MethodGet, "/dns-query?dns="+encoded, nil).WithContext(ctx)
+		req.RemoteAddr = "198.51.100.20:1234"
+		rec := httptest.NewRecorder()
+		h(rec, req)
+	}()
 
-	req1 := httptest.NewRequest(http.MethodGet, "/dns-query?dns="+encoded, nil)
-	req1.RemoteAddr = "198.51.100.20:1234"
-	rec1 := httptest.NewRecorder()
-	h(rec1, req1)
-	if rec1.Code != http.StatusOK {
-		t.Fatalf("first guarded request status = %d, want %d", rec1.Code, http.StatusOK)
+	select {
+	case <-requestSeen:
+	case <-time.After(time.Second):
+		t.Fatal("first request did not reach the DNS backend")
 	}
 
-	req2 := httptest.NewRequest(http.MethodGet, "/dns-query?dns="+encoded, nil)
-	req2.RemoteAddr = "198.51.100.20:5678"
-	rec2 := httptest.NewRecorder()
-	h(rec2, req2)
-	if rec2.Code != http.StatusTooManyRequests {
-		t.Fatalf("second guarded request status = %d, want %d", rec2.Code, http.StatusTooManyRequests)
+	second := httptest.NewRequest(http.MethodGet, "/dns-query?dns="+encoded, nil)
+	second.RemoteAddr = "198.51.100.20:5678"
+	second.Host = "other.example.test"
+	rec := httptest.NewRecorder()
+	h(rec, second)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("second concurrent request status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
 	}
 
-	req3 := httptest.NewRequest(http.MethodGet, "/dns-query?dns="+encoded, nil)
-	req3.RemoteAddr = "198.51.100.20:5678"
-	req3.Host = "other.example.test"
-	rec3 := httptest.NewRecorder()
-	h(rec3, req3)
-	if rec3.Code != http.StatusTooManyRequests {
-		t.Fatalf("different-host guarded request status = %d, want %d", rec3.Code, http.StatusTooManyRequests)
+	cancel()
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first request did not stop after cancellation")
 	}
 }
 
@@ -1034,8 +916,6 @@ func TestGuardListenerTrustedProxyIsExemptFromPerIPConnectionCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	guard := newClientGuard(clientGuardConfig{
-		rateLimit:         10,
-		rateBurst:         10,
 		maxIPConns:        1,
 		maxIPRequests:     4,
 		maxClientStates:   16,
@@ -1069,10 +949,6 @@ func TestGuardListenerEnforcesPerIPConnectionCapForUntrustedPeers(t *testing.T) 
 		t.Fatal(err)
 	}
 	guard := newClientGuard(clientGuardConfig{
-		rateLimit:       10,
-		rateBurst:       10,
-		globalRateLimit: 1000,
-		globalRateBurst: 1000,
 		maxIPConns:      1,
 		maxIPRequests:   4,
 		maxClientStates: 16,
@@ -1122,17 +998,6 @@ func TestGuardListenerEnforcesPerIPConnectionCapForUntrustedPeers(t *testing.T) 
 		t.Fatalf("connection after releasing the per-IP slot was rejected: %v", err)
 	}
 	_ = thirdAccepted.Close()
-}
-
-func TestEnvFloatRejectsNaN(t *testing.T) {
-	t.Setenv("DOH_TEST_FLOAT", "NaN")
-	if got := envFloat("DOH_TEST_FLOAT", 2.5, 0.1, 100); got != 2.5 {
-		t.Fatalf("envFloat(NaN) = %v, want fallback 2.5", got)
-	}
-	t.Setenv("DOH_TEST_FLOAT", "Inf")
-	if got := envFloat("DOH_TEST_FLOAT", 2.5, 0.1, 100); got != 100 {
-		t.Fatalf("envFloat(Inf) = %v, want clamp 100", got)
-	}
 }
 
 func TestEnvIntTrimsWhitespaceAndClamps(t *testing.T) {

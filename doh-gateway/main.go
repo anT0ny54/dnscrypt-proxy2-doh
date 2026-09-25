@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -22,7 +21,8 @@ import (
 )
 
 const (
-	maxDNSPacket = 65535
+	maxDNSPacket     = 65535
+	fixedDNSUpstream = "127.0.0.1:5300"
 
 	// defaultServerTimeout bounds one full local DNS exchange: the UDP attempt
 	// plus, if the response is truncated or UDP fails early, the TCP retry.
@@ -36,7 +36,7 @@ const (
 
 	defaultMaxBody        = 4 << 10 // 4 KiB request query limit
 	defaultMaxInflight    = 64
-	defaultMaxConns       = 256
+	defaultMaxConns       = 512
 	maxMaxInflight        = 64
 	maxMaxConns           = 1024
 	defaultDoHIdleTimeout = 120 * time.Second
@@ -114,26 +114,21 @@ func envInt(key string, fallback, min, max int) int {
 	return n
 }
 
-func envFloat(key string, fallback, min, max float64) float64 {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return fallback
-	}
-	n, err := strconv.ParseFloat(v, 64)
-	// NaN compares false against every bound and would silently disable the
-	// token bucket (NaN < 1 is false), so it must be rejected explicitly.
-	if err != nil || math.IsNaN(n) || n < min {
-		return fallback
-	}
-	if n > max {
-		return max
-	}
-	return n
-}
-
 func serverTimeoutFromEnv() time.Duration {
 	seconds := envInt("SERVER_TIMEOUT", int(defaultServerTimeout/time.Second), 1, 60)
 	return time.Duration(seconds) * time.Second
+}
+
+func bindHostFromEnv() (string, error) {
+	host := env("DOH_BIND", "0.0.0.0")
+	if host == "0.0.0.0" || host == "::" {
+		return host, nil
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return "", fmt.Errorf("DOH_BIND must be an IP address, got %q", host)
+	}
+	return ip.String(), nil
 }
 
 // decodeQuery decodes a DoH "dns" GET parameter, which in practice arrives in
@@ -514,7 +509,7 @@ func dohHandlerWithGuardTimeout(upstream, path string, maxBody, maxInflight int,
 			clientIP := requestClientIP(r, trustedProxies)
 			if !guard.beginRequest(clientIP, time.Now()) {
 				w.Header().Set("Retry-After", "1")
-				writeText(w, http.StatusTooManyRequests, "client rate/concurrency limit exceeded\n")
+				writeText(w, http.StatusServiceUnavailable, "client concurrency limit exceeded\n")
 				return
 			}
 			// Evaluate time.Now() when the request finishes, not when the
@@ -616,7 +611,7 @@ func dohHandlerWithGuard(upstream, path string, maxBody, maxInflight int, transp
 
 func main() {
 	port := env("PORT", "8080")
-	upstream := env("DOH_UPSTREAM_ADDR", "127.0.0.1:5300")
+	upstream := fixedDNSUpstream
 	path := env("DOH_PATH", "/dns-query")
 	maxBody := envInt("DOH_MAX_BODY", defaultMaxBody, 12, maxDNSPacket)
 	maxInflight := envInt("DOH_MAX_INFLIGHT", defaultMaxInflight, 1, maxMaxInflight)
@@ -643,7 +638,10 @@ func main() {
 	// than from the raw pre-clamp DOH_MAX_BODY value.
 	effMaxBody, effMaxInflight, effTransport := effectiveDoHLimits(maxBody, maxInflight, transport)
 
-	bindHost := env("DOH_BIND", "0.0.0.0")
+	bindHost, err := bindHostFromEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
 	addr := net.JoinHostPort(bindHost, port)
 	srv := &http.Server{
 		Addr:              addr,
@@ -664,9 +662,9 @@ func main() {
 	log.Printf("DoH gateway listening on http://%s%s -> %s", addr, path, upstream)
 	log.Printf("health endpoints: http://%s/healthz and /readyz", addr)
 	log.Printf("limits: max %d in-flight exchanges, max %d TCP connections, max %d-byte DoH query", effMaxInflight, maxConns, effMaxBody)
-	log.Printf("abuse guard: %.3f rps (%.0f/min) / burst %d per source IP; %.3f rps (%.0f/min) / burst %d global; max %d conns per source IP, %d concurrent requests per source IP, max %d client states", guardConfig.rateLimit, guardConfig.rateLimit*60, guardConfig.rateBurst, guardConfig.globalRateLimit, guardConfig.globalRateLimit*60, guardConfig.globalRateBurst, guardConfig.maxIPConns, guardConfig.maxIPRequests, guardConfig.maxClientStates)
+	log.Printf("resource guard: max %d conns per source IP, %d concurrent requests per source IP, max %d client states", guardConfig.maxIPConns, guardConfig.maxIPRequests, guardConfig.maxClientStates)
 	if len(guardConfig.trustedProxyCIDRs) == 0 {
-		log.Printf("DOH_TRUSTED_PROXY_CIDRS is unset: clients are identified by the TCP peer address. Behind a reverse proxy every user then shares the same source-IP rate bucket; set it to the proxy's CIDRs")
+		log.Printf("DOH_TRUSTED_PROXY_CIDRS is unset: clients are identified by the TCP peer address. Behind a reverse proxy every user then shares the same source-IP concurrency bucket; set it to the proxy's CIDRs")
 	}
 	log.Printf("DNS transport guard: UDP %d bytes, TCP frame %d bytes, max %d TCP queries/connection, SERVER_TIMEOUT=%s", effTransport.maxUDPPacket, effTransport.maxTCPFrame, effTransport.maxTCPQueries, serverTimeout)
 
