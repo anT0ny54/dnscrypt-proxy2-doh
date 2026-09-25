@@ -86,10 +86,6 @@ SnapDeploy terminates TLS in front of the container, so without further configur
 
 Only list networks you actually trust: a trusted peer can choose which client IP a request is attributed to.
 
-### Legacy compatibility
-
-The older environment names `DOH_RATE_RPS` and `DOH_MAX_IP_CONNS` remain accepted as aliases for `DOH_RATE_LIMIT` and `IP_CONN_LIMIT`. When both names are set, the new variable takes precedence.
-
 ## DoH behavior and hardening
 
 Supported methods:
@@ -155,11 +151,11 @@ Safe defaults are built into the image. Normally only `PORT` needs to match the 
 | `DOH_MAX_BODY` | `4096` | Public request DNS-message limit; effective cap is the lower of this value and `DOH_MAX_TCP_FRAME`. |
 | `DOH_MAX_INFLIGHT` | `64` | Hard-capped at `64`; keeps concurrent DNS work proportionate to 0.25 vCPU. |
 | `DOH_MAX_CONNS` | `256` | Hard-capped at `1024`; excess accepted connections are immediately closed. |
-| `DOH_RATE_LIMIT` | `12` (720/min) | Per-source-IP sustained rate; hard-capped at `100`. Legacy `DOH_RATE_RPS` remains accepted as an alias. |
+| `DOH_RATE_LIMIT` | `12` (720/min) | Per-source-IP sustained rate; hard-capped at `100`. |
 | `DOH_RATE_BURST` | `200` | Per-source-IP burst; hard-capped at `256`. |
 | `GLOBAL_RATE_LIMIT` | `80` (4800/min) | Gateway-wide sustained rate; hard-capped at `500`. |
 | `GLOBAL_RATE_BURST` | `200` | Gateway-wide burst; hard-capped at `512`. |
-| `IP_CONN_LIMIT` | `32` | Per-source-IP active connection cap (trusted proxies exempt); hard-capped at `32`. Legacy `DOH_MAX_IP_CONNS` remains accepted as an alias. |
+| `IP_CONN_LIMIT` | `32` | Per-source-IP active connection cap (trusted proxies exempt); hard-capped at `32`. |
 | `DOH_MAX_IP_REQUESTS` | `64` | Concurrent request cap per source IP; hard-capped at `64`. |
 | `DOH_MAX_CLIENT_STATES` | `8192` | Bounded to `16`-`32768`, rounded down to a multiple of the 16 guard shards; rate state is keyed only by source IP. |
 | `SERVER_TIMEOUT` | `6` seconds | Shared local DNS exchange deadline, including UDP-to-TCP fallback; client disconnect cancellation remains separate. |
