@@ -9,12 +9,16 @@ dns_listen=127.0.0.1:5300
 port="${PORT:-8080}"
 doh_path="${DOH_PATH:-/dns-query}"
 doh_bind="${DOH_BIND:-0.0.0.0}"
-dnscrypt_gomemlimit="${DNSCRYPT_GOMEMLIMIT:-256MiB}"
+global_conn_limit="${GLOBAL_CONN_LIMIT:-${DOH_MAX_CONNS:-128}}"
+dnscrypt_gomemlimit="${DNSCRYPT_GOMEMLIMIT:-288MiB}"
 doh_gomemlimit="${DOH_GOMEMLIMIT:-64MiB}"
 public_doh_url="${PUBLIC_DOH_URL:-}"
 
 # dnscrypt-proxy's max_clients is fixed at 64 in the checked-in config and the
-# gateway's DOH_MAX_INFLIGHT is hard-capped at the same 64. The resolver address
+# gateway's DOH_MAX_INFLIGHT is hard-capped at the same 64. GLOBAL_CONN_LIMIT
+# defaults to 128 and IP_CONN_LIMIT to 64 for the 512 MiB / 0.25 vCPU profile.
+# The legacy DOH_MAX_CONNS variable remains accepted as a compatibility alias.
+# The resolver address
 # is fixed at 127.0.0.1:5300 so runtime variables cannot introduce another DNS
 # path or hostname resolution outside dnscrypt-proxy.
 
@@ -26,7 +30,8 @@ if ! "$DNSCRYPT_BIN" -config "$CONFIG_FILE" -check; then
 fi
 
 echo "Starting dnscrypt-proxy 2 + DoH gateway"
-echo "  dnscrypt-proxy : $dns_listen (max_clients=64; gateway DOH_MAX_INFLIGHT is capped at 64)"
+echo "  dnscrypt-proxy : $dns_listen (max_clients=64)"
+echo "  gateway limits : GLOBAL_CONN_LIMIT=${global_conn_limit}; IP_CONN_LIMIT=${IP_CONN_LIMIT:-64}; DOH_MAX_INFLIGHT=${DOH_MAX_INFLIGHT:-64}; DOH_MAX_BODY=${DOH_MAX_BODY:-4096}"
 echo "  resolvers      : HaGeZiDNS1, HaGeZiDNS2, HaGeZiDNS3 (static)"
 echo "  DoH endpoint   : ${doh_bind}:$port$doh_path"
 echo "  memory targets : ${dnscrypt_gomemlimit} dnscrypt-proxy + ${doh_gomemlimit} doh-gateway"
