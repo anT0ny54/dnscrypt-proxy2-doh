@@ -36,9 +36,9 @@ const (
 
 	defaultMaxBody        = 4 << 10 // 4 KiB request query limit
 	defaultMaxInflight    = 64
-	defaultMaxConns       = 512
+	defaultMaxConns       = 128
 	maxMaxInflight        = 64
-	maxMaxConns           = 1024
+	maxMaxConns           = 128
 	defaultDoHIdleTimeout = 120 * time.Second
 
 	// headerOverhead budgets for the request line/method/host and the fixed
@@ -506,7 +506,16 @@ func dohHandlerWithGuardTimeout(upstream, path string, maxBody, maxInflight int,
 		}
 
 		if guard != nil {
-			clientIP := requestClientIP(r, trustedProxies)
+			clientIP, valid := requestClientIP(r, trustedProxies)
+			if !valid {
+				writeText(w, http.StatusBadRequest, "invalid or missing client identity\n")
+				return
+			}
+			if conn := guardConnFromContext(r.Context()); conn != nil && !conn.rebindClient(clientIP, time.Now()) {
+				w.Header().Set("Retry-After", "1")
+				writeText(w, http.StatusServiceUnavailable, "client connection limit exceeded\n")
+				return
+			}
 			if !guard.beginRequest(clientIP, time.Now()) {
 				w.Header().Set("Retry-After", "1")
 				writeText(w, http.StatusServiceUnavailable, "client concurrency limit exceeded\n")
@@ -609,13 +618,27 @@ func dohHandlerWithGuard(upstream, path string, maxBody, maxInflight int, transp
 	return dohHandlerWithGuardTimeout(upstream, path, maxBody, maxInflight, transport, guard, trustedProxies, defaultServerTimeout)
 }
 
+type guardConnContextKey struct{}
+
+func guardConnFromContext(ctx context.Context) *guardConn {
+	if conn, ok := ctx.Value(guardConnContextKey{}).(*guardConn); ok {
+		return conn
+	}
+	return nil
+}
+
+func globalConnLimitFromEnv() int {
+	legacy := envInt("DOH_MAX_CONNS", defaultMaxConns, 1, maxMaxConns)
+	return envInt("GLOBAL_CONN_LIMIT", legacy, 1, maxMaxConns)
+}
+
 func main() {
 	port := env("PORT", "8080")
 	upstream := fixedDNSUpstream
 	path := env("DOH_PATH", "/dns-query")
 	maxBody := envInt("DOH_MAX_BODY", defaultMaxBody, 12, maxDNSPacket)
 	maxInflight := envInt("DOH_MAX_INFLIGHT", defaultMaxInflight, 1, maxMaxInflight)
-	maxConns := envInt("DOH_MAX_CONNS", defaultMaxConns, 1, maxMaxConns)
+	maxConns := globalConnLimitFromEnv()
 	dohIdleTimeoutSeconds := envInt("DOH_IDLE_TIMEOUT", int(defaultDoHIdleTimeout/time.Second), 1, 3600)
 	dohIdleTimeout := time.Duration(dohIdleTimeoutSeconds) * time.Second
 	serverTimeout := serverTimeoutFromEnv()
@@ -651,6 +674,12 @@ func main() {
 		WriteTimeout:      httpWriteTimeout,
 		IdleTimeout:       dohIdleTimeout,
 		MaxHeaderBytes:    maxHeaderBytesFor(effMaxBody),
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			if gc, ok := c.(*guardConn); ok {
+				return context.WithValue(ctx, guardConnContextKey{}, gc)
+			}
+			return ctx
+		},
 	}
 
 	ln, err := net.Listen("tcp", addr)

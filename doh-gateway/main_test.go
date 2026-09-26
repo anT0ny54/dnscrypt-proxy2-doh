@@ -98,11 +98,11 @@ func TestTunedDefaults(t *testing.T) {
 	if cfg.maxClientStates != defaultDoHClientStates {
 		t.Fatalf("default client states = %d, want %d", cfg.maxClientStates, defaultDoHClientStates)
 	}
-	if defaultIPConnLimit != 16 || defaultDoHIPRequests != 16 {
-		t.Fatalf("public per-client defaults = %d connections / %d requests, want 16 / 16", defaultIPConnLimit, defaultDoHIPRequests)
+	if defaultIPConnLimit != 64 || defaultDoHIPRequests != 16 {
+		t.Fatalf("public per-client defaults = %d connections / %d requests, want 64 / 16", defaultIPConnLimit, defaultDoHIPRequests)
 	}
-	if defaultMaxInflight != 64 || defaultMaxConns != 512 {
-		t.Fatalf("public concurrency defaults = %d in-flight / %d connections, want 64 / 512", defaultMaxInflight, defaultMaxConns)
+	if defaultMaxInflight != 64 || defaultMaxConns != 128 {
+		t.Fatalf("public concurrency defaults = %d in-flight / %d connections, want 64 / 128", defaultMaxInflight, defaultMaxConns)
 	}
 	if defaultMaxConns > maxMaxConns {
 		t.Fatalf("default connections = %d exceeds hard maximum %d", defaultMaxConns, maxMaxConns)
@@ -317,14 +317,50 @@ func TestRequestClientIPTrustsOnlyConfiguredProxy(t *testing.T) {
 	prefix := netip.MustParsePrefix("192.0.2.0/24")
 	req := httptest.NewRequest(http.MethodGet, "http://example.test/dns-query", nil)
 	req.RemoteAddr = "192.0.2.10:12345"
-	req.Header.Set("X-Forwarded-For", "198.51.100.7, 192.0.2.11")
-	if got := requestClientIP(req, []netip.Prefix{prefix}); got.String() != "198.51.100.7" {
-		t.Fatalf("trusted proxy client IP = %s, want 198.51.100.7", got)
+	req.Header.Set("X-Forwarded-For", "198.51.100.7, 203.0.113.11")
+	got, ok := requestClientIP(req, []netip.Prefix{prefix})
+	if !ok || got.String() != "203.0.113.11" {
+		t.Fatalf("trusted proxy client IP = %s (ok=%v), want final X-Forwarded-For 203.0.113.11", got, ok)
+	}
+
+	req.Header.Set("X-Forwarded-For", "198.51.100.7, not-an-ip")
+	if _, ok := requestClientIP(req, []netip.Prefix{prefix}); ok {
+		t.Fatal("malformed final X-Forwarded-For was accepted")
+	}
+
+	req.Header.Del("X-Forwarded-For")
+	if _, ok := requestClientIP(req, []netip.Prefix{prefix}); ok {
+		t.Fatal("missing X-Forwarded-For was accepted for a trusted proxy")
 	}
 
 	req.RemoteAddr = "203.0.113.10:12345"
-	if got := requestClientIP(req, []netip.Prefix{prefix}); got.String() != "203.0.113.10" {
-		t.Fatalf("untrusted peer accepted forwarded IP %s", got)
+	req.Header.Set("X-Forwarded-For", "198.51.100.7")
+	got, ok = requestClientIP(req, []netip.Prefix{prefix})
+	if !ok || got.String() != "203.0.113.10" {
+		t.Fatalf("untrusted peer accepted forwarded IP %s (ok=%v)", got, ok)
+	}
+}
+
+func TestGlobalConnLimitUsesCanonicalEnvAndLegacyAlias(t *testing.T) {
+	t.Setenv("GLOBAL_CONN_LIMIT", "")
+	t.Setenv("DOH_MAX_CONNS", "")
+	if got := globalConnLimitFromEnv(); got != 128 {
+		t.Fatalf("default global connection limit = %d, want 128", got)
+	}
+
+	t.Setenv("DOH_MAX_CONNS", "64")
+	if got := globalConnLimitFromEnv(); got != 64 {
+		t.Fatalf("legacy DOH_MAX_CONNS = %d, want 64", got)
+	}
+
+	t.Setenv("GLOBAL_CONN_LIMIT", "96")
+	if got := globalConnLimitFromEnv(); got != 96 {
+		t.Fatalf("GLOBAL_CONN_LIMIT = %d, want 96", got)
+	}
+
+	t.Setenv("GLOBAL_CONN_LIMIT", "999")
+	if got := globalConnLimitFromEnv(); got != 128 {
+		t.Fatalf("GLOBAL_CONN_LIMIT over hard cap = %d, want 128", got)
 	}
 }
 
@@ -998,6 +1034,46 @@ func TestGuardListenerEnforcesPerIPConnectionCapForUntrustedPeers(t *testing.T) 
 		t.Fatalf("connection after releasing the per-IP slot was rejected: %v", err)
 	}
 	_ = thirdAccepted.Close()
+}
+
+func TestGuardConnRebindsPerClientIdentity(t *testing.T) {
+	g := newClientGuard(clientGuardConfig{
+		maxIPConns:      1,
+		maxIPRequests:   4,
+		maxClientStates: 16,
+		stateTTL:        5 * time.Minute,
+	})
+
+	client, server := net.Pipe()
+	defer server.Close()
+
+	gc := &guardConn{
+		Conn:          client,
+		guard:         g,
+		ip:            netip.MustParseAddr("198.51.100.10"),
+		tracked:       true,
+		globalRelease: func() {},
+	}
+	now := time.Now()
+	if !g.openConnection(gc.ip, now) {
+		t.Fatal("initial connection slot was not opened")
+	}
+
+	newIP := netip.MustParseAddr("203.0.113.20")
+	if !gc.rebindClient(newIP, now) {
+		t.Fatal("connection failed to rebind to available client identity")
+	}
+	if gc.ip != newIP || !gc.tracked {
+		t.Fatalf("connection identity = %s tracked=%v, want %s / true", gc.ip, gc.tracked, newIP)
+	}
+
+	// The rebind should own the single slot; a second connection for the same
+	// client must be rejected.
+	if g.openConnection(gc.ip, now) {
+		t.Fatal("second connection unexpectedly opened for capped client")
+	}
+
+	gc.Close()
 }
 
 func TestEnvIntTrimsWhitespaceAndClamps(t *testing.T) {

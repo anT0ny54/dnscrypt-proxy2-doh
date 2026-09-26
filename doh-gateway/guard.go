@@ -16,14 +16,14 @@ import (
 )
 
 const (
-	defaultIPConnLimit     = 16
+	defaultIPConnLimit     = 64
 	defaultDoHIPRequests   = 16
 	defaultDoHClientStates = 8192
 	defaultDoHStateTTL     = 5 * time.Minute
 	defaultMaxUDPPacket    = 8 << 10
 	defaultMaxTCPFrame     = 8 << 10
 	defaultMaxTCPQueries   = 1
-	maxIPConnLimit         = 32
+	maxIPConnLimit         = 64
 	maxDoHIPRequests       = 64
 	maxDoHClientStates     = 32768
 	minDoHClientStates     = 16
@@ -252,6 +252,16 @@ func (g *clientGuard) openConnection(ip netip.Addr, now time.Time) bool {
 	return true
 }
 
+func (g *clientGuard) touchConnection(ip netip.Addr, now time.Time) {
+	key := clientIPKey(ip)
+	s := &g.shards[clientShardIndex(key)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st, ok := s.items[key]; ok {
+		st.lastSeen = now
+	}
+}
+
 func (g *clientGuard) closeConnection(ip netip.Addr, now time.Time) {
 	key := clientIPKey(ip)
 	s := &g.shards[clientShardIndex(key)]
@@ -307,16 +317,19 @@ func (l *guardListener) Accept() (net.Conn, error) {
 		}
 
 		now := time.Now()
-		ip := remoteAddrIP(conn.RemoteAddr())
+		ip, valid := remoteAddrIP(conn.RemoteAddr())
+		if !valid {
+			_ = conn.Close()
+			continue
+		}
 		if !l.reserveGlobal() {
 			_ = conn.Close()
 			continue
 		}
-		// A configured trusted reverse proxy multiplexes many real clients over
-		// its connections, so the per-source-IP connection cap would throttle
-		// every user at once. It still counts against the global connection
-		// cap, and per-client limits are applied per request using the
-		// forwarded client IP instead.
+		// Direct peers have a stable client identity and can be charged at
+		// accept-time. Trusted reverse proxies multiplex users, so their socket
+		// address is not charged; the request handler binds the connection to the
+		// forwarded client identity before admitting the request.
 		tracked := !trustedProxyContains(l.guard.cfg.trustedProxyCIDRs, ip)
 		if tracked && !l.guard.openConnection(ip, now) {
 			l.releaseGlobal()
@@ -341,27 +354,59 @@ func (l *guardListener) Close() error {
 type guardConn struct {
 	net.Conn
 	guard         *clientGuard
+	stateMu       sync.Mutex
 	ip            netip.Addr
 	tracked       bool // counted against the per-source-IP connection cap
+	closed        bool
 	globalRelease func()
 	once          sync.Once
+}
+
+func (c *guardConn) rebindClient(ip netip.Addr, now time.Time) bool {
+	if !ip.IsValid() || ip.IsUnspecified() {
+		return false
+	}
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if c.closed {
+		return false
+	}
+	if c.tracked && c.ip == ip {
+		c.guard.touchConnection(ip, now)
+		return true
+	}
+	if !c.guard.openConnection(ip, now) {
+		return false
+	}
+	if c.tracked {
+		c.guard.closeConnection(c.ip, now)
+	}
+	c.ip = ip
+	c.tracked = true
+	return true
 }
 
 func (c *guardConn) Close() error {
 	var err error
 	c.once.Do(func() {
+		c.stateMu.Lock()
+		c.closed = true
+		ip := c.ip
+		tracked := c.tracked
+		c.stateMu.Unlock()
+
 		err = c.Conn.Close()
-		if c.tracked {
-			c.guard.closeConnection(c.ip, time.Now())
+		if tracked {
+			c.guard.closeConnection(ip, time.Now())
 		}
 		c.globalRelease()
 	})
 	return err
 }
 
-func remoteAddrIP(addr net.Addr) netip.Addr {
+func remoteAddrIP(addr net.Addr) (netip.Addr, bool) {
 	if addr == nil {
-		return netip.IPv4Unspecified()
+		return netip.Addr{}, false
 	}
 	return remoteAddrIPString(addr.String())
 }
@@ -375,46 +420,45 @@ func trustedProxyContains(prefixes []netip.Prefix, ip netip.Addr) bool {
 	return false
 }
 
-// requestClientIP trusts X-Forwarded-For only when the immediate peer is in an
-// explicitly configured trusted-proxy network. Walking the list from right to
-// left prevents an untrusted client from simply prepending a spoofed address.
-func requestClientIP(r *http.Request, trustedProxies []netip.Prefix) netip.Addr {
-	remote := remoteAddrIPString(r.RemoteAddr)
+// requestClientIP uses the direct peer when no trusted reverse proxy is
+// configured. For a trusted proxy, only the final X-Forwarded-For value is used;
+// a missing or malformed forwarded identity is rejected rather than pooled into
+// a shared proxy bucket.
+func requestClientIP(r *http.Request, trustedProxies []netip.Prefix) (netip.Addr, bool) {
+	remote, ok := remoteAddrIPString(r.RemoteAddr)
+	if !ok || remote.IsUnspecified() {
+		return netip.Addr{}, false
+	}
 	if len(trustedProxies) == 0 || !trustedProxyContains(trustedProxies, remote) {
-		return remote
+		return remote, true
 	}
 
 	values := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
-	for i := len(values) - 1; i >= 0; i-- {
-		ip, err := netip.ParseAddr(strings.TrimSpace(values[i]))
-		if err != nil {
-			continue
-		}
-		ip = ip.Unmap()
-		if !trustedProxyContains(trustedProxies, ip) {
-			return ip
-		}
+	if len(values) == 0 {
+		return netip.Addr{}, false
 	}
-
-	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
-		if ip, err := netip.ParseAddr(realIP); err == nil {
-			return ip.Unmap()
-		}
+	final := strings.TrimSpace(values[len(values)-1])
+	if final == "" {
+		return netip.Addr{}, false
 	}
-	return remote
+	ip, err := netip.ParseAddr(final)
+	if err != nil || !ip.IsValid() || ip.IsUnspecified() {
+		return netip.Addr{}, false
+	}
+	return ip.Unmap(), true
 }
 
-func remoteAddrIPString(addr string) netip.Addr {
+func remoteAddrIPString(addr string) (netip.Addr, bool) {
 	text := strings.TrimSpace(addr)
 	if host, _, err := net.SplitHostPort(text); err == nil {
-		if ip, err := netip.ParseAddr(host); err == nil {
-			return ip.Unmap()
+		if ip, err := netip.ParseAddr(host); err == nil && ip.IsValid() {
+			return ip.Unmap(), true
 		}
 	}
-	if ip, err := netip.ParseAddr(text); err == nil {
-		return ip.Unmap()
+	if ip, err := netip.ParseAddr(text); err == nil && ip.IsValid() {
+		return ip.Unmap(), true
 	}
-	return netip.IPv4Unspecified()
+	return netip.Addr{}, false
 }
 
 var errTCPQueriesExceeded = errors.New("maximum TCP DNS queries per connection exceeded")
