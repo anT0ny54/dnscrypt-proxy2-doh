@@ -16,19 +16,21 @@ import (
 )
 
 const (
-	defaultIPConnLimit     = 64
-	defaultDoHIPRequests   = 16
-	defaultDoHClientStates = 8192
-	defaultDoHStateTTL     = 5 * time.Minute
-	defaultMaxUDPPacket    = 8 << 10
-	defaultMaxTCPFrame     = 8 << 10
-	defaultMaxTCPQueries   = 1
-	maxIPConnLimit         = 64
-	maxDoHIPRequests       = 64
-	maxDoHClientStates     = 32768
-	minDoHClientStates     = 16
-	maxDoHTransportSize    = maxDNSPacket
-	clientGuardShardCount  = 16
+	defaultIPConnLimit          = 64
+	defaultDoHIPRequests        = 16
+	defaultDoHRequestsPerMinute = 100
+	maxDoHRequestsPerMinute     = 100
+	defaultDoHClientStates      = 8192
+	defaultDoHStateTTL          = 5 * time.Minute
+	defaultMaxUDPPacket         = 8 << 10
+	defaultMaxTCPFrame          = 8 << 10
+	defaultMaxTCPQueries        = 1
+	maxIPConnLimit              = 64
+	maxDoHIPRequests            = 64
+	maxDoHClientStates          = 32768
+	minDoHClientStates          = 16
+	maxDoHTransportSize         = maxDNSPacket
+	clientGuardShardCount       = 16
 )
 
 type dnsTransportLimits struct {
@@ -55,16 +57,18 @@ func dnsTransportLimitsFromEnv() dnsTransportLimits {
 }
 
 type clientGuardConfig struct {
-	maxIPConns        int
-	maxIPRequests     int
-	maxClientStates   int
-	stateTTL          time.Duration
-	trustedProxyCIDRs []netip.Prefix
+	maxIPConns             int
+	maxIPRequests          int
+	maxIPRequestsPerMinute int
+	maxClientStates        int
+	stateTTL               time.Duration
+	trustedProxyCIDRs      []netip.Prefix
 }
 
 func clientGuardConfigFromEnv() (clientGuardConfig, error) {
 	maxIPConns := envInt("IP_CONN_LIMIT", defaultIPConnLimit, 1, maxIPConnLimit)
 	maxIPRequests := envInt("DOH_MAX_IP_REQUESTS", defaultDoHIPRequests, 1, maxDoHIPRequests)
+	maxIPRequestsPerMinute := envInt("DOH_MAX_IP_REQUESTS_PER_MINUTE", defaultDoHRequestsPerMinute, 1, maxDoHRequestsPerMinute)
 	maxStates := envInt("DOH_MAX_CLIENT_STATES", defaultDoHClientStates, minDoHClientStates, maxDoHClientStates)
 	maxStates = (maxStates / clientGuardShardCount) * clientGuardShardCount
 	if maxStates < minDoHClientStates {
@@ -77,11 +81,12 @@ func clientGuardConfigFromEnv() (clientGuardConfig, error) {
 	}
 
 	return clientGuardConfig{
-		maxIPConns:        maxIPConns,
-		maxIPRequests:     maxIPRequests,
-		maxClientStates:   maxStates,
-		stateTTL:          defaultDoHStateTTL,
-		trustedProxyCIDRs: cidrs,
+		maxIPConns:             maxIPConns,
+		maxIPRequests:          maxIPRequests,
+		maxIPRequestsPerMinute: maxIPRequestsPerMinute,
+		maxClientStates:        maxStates,
+		stateTTL:               defaultDoHStateTTL,
+		trustedProxyCIDRs:      cidrs,
 	}, nil
 }
 
@@ -112,9 +117,12 @@ type clientKey struct {
 }
 
 type clientState struct {
-	lastSeen time.Time
-	ipConns  int
-	requests int
+	lastSeen       time.Time
+	ipConns        int
+	requests       int
+	rateTimestamps [maxDoHRequestsPerMinute]int64
+	rateHead       uint8
+	rateCount      uint8
 }
 
 type clientShard struct {
@@ -124,8 +132,8 @@ type clientShard struct {
 
 // clientGuard uses fixed-size shards and a hard per-shard entry cap. This keeps
 // memory bounded even when an attacker cycles through huge numbers of source IPs.
-// Eviction only removes idle entries, so active connection/request accounting is
-// never lost underneath a live client.
+// Eviction only removes entries with no active connection/request work and no
+// active rolling-window quota, so live accounting and rate state are preserved.
 type clientGuard struct {
 	cfg      clientGuardConfig
 	shards   [clientGuardShardCount]clientShard
@@ -138,6 +146,12 @@ func newClientGuard(cfg clientGuardConfig) *clientGuard {
 	}
 	if cfg.maxIPRequests <= 0 {
 		cfg.maxIPRequests = defaultDoHIPRequests
+	}
+	if cfg.maxIPRequestsPerMinute <= 0 {
+		cfg.maxIPRequestsPerMinute = defaultDoHRequestsPerMinute
+	}
+	if cfg.maxIPRequestsPerMinute > maxDoHRequestsPerMinute {
+		cfg.maxIPRequestsPerMinute = maxDoHRequestsPerMinute
 	}
 	if cfg.maxClientStates < minDoHClientStates {
 		cfg.maxClientStates = minDoHClientStates
@@ -170,6 +184,14 @@ func clientIPKey(ip netip.Addr) clientKey {
 	return clientKey{ip: ip}
 }
 
+func rateWindowActiveLocked(st *clientState, now time.Time) bool {
+	if st.rateCount == 0 {
+		return false
+	}
+	cutoff := now.UnixNano() - int64(time.Minute)
+	return st.rateTimestamps[st.rateHead] > cutoff
+}
+
 func (g *clientGuard) getStateLocked(s *clientShard, key clientKey, now time.Time) (*clientState, bool) {
 	if st, ok := s.items[key]; ok {
 		st.lastSeen = now
@@ -179,25 +201,22 @@ func (g *clientGuard) getStateLocked(s *clientShard, key clientKey, now time.Tim
 	if len(s.items) >= g.shardCap {
 		var oldestKey clientKey
 		var oldest *clientState
-		var expiredKey clientKey
-		var expired *clientState
 		for candidateKey, candidate := range s.items {
 			if candidate.ipConns != 0 || candidate.requests != 0 {
 				continue
 			}
-			if !candidate.lastSeen.Add(g.cfg.stateTTL).After(now) &&
-				(expired == nil || candidate.lastSeen.Before(expired.lastSeen)) {
-				expiredKey = candidateKey
-				expired = candidate
+			if rateWindowActiveLocked(candidate, now) {
+				// Do not evict a state that still has an active rolling-window
+				// quota. Otherwise high-cardinality source-IP churn could reset
+				// that client's rate-limit state and bypass the 100/minute cap.
+				continue
 			}
 			if oldest == nil || candidate.lastSeen.Before(oldest.lastSeen) {
 				oldestKey = candidateKey
 				oldest = candidate
 			}
 		}
-		if expired != nil {
-			delete(s.items, expiredKey)
-		} else if oldest != nil {
+		if oldest != nil {
 			delete(s.items, oldestKey)
 		} else {
 			return nil, false
@@ -209,18 +228,64 @@ func (g *clientGuard) getStateLocked(s *clientShard, key clientKey, now time.Tim
 	return st, true
 }
 
-func (g *clientGuard) beginRequest(ip netip.Addr, now time.Time) bool {
+type requestAdmission uint8
+
+const (
+	requestAdmissionAllowed requestAdmission = iota
+	requestAdmissionConcurrencyLimited
+	requestAdmissionRateLimited
+)
+
+func (g *clientGuard) admitRequest(ip netip.Addr, now time.Time) requestAdmission {
 	key := clientIPKey(ip)
 	s := &g.shards[clientShardIndex(key)]
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	st, ok := g.getStateLocked(s, key, now)
-	if !ok || st.requests >= g.cfg.maxIPRequests {
-		return false
+	if !ok {
+		return requestAdmissionConcurrencyLimited
+	}
+	if st.requests >= g.cfg.maxIPRequests {
+		// A request rejected only because the concurrency cap is full must not
+		// consume a rate token; otherwise a burst of concurrent work could
+		// spend the minute quota without doing any DNS exchange.
+		return requestAdmissionConcurrencyLimited
+	}
+	if !g.takeRateTokenLocked(st, now) {
+		return requestAdmissionRateLimited
 	}
 	st.requests++
 	st.lastSeen = now
+	return requestAdmissionAllowed
+}
+
+func (g *clientGuard) beginRequest(ip netip.Addr, now time.Time) bool {
+	return g.admitRequest(ip, now) == requestAdmissionAllowed
+}
+
+func (g *clientGuard) takeRateTokenLocked(st *clientState, now time.Time) bool {
+	const ringSize = maxDoHRequestsPerMinute
+	nowNanos := now.UnixNano()
+	cutoff := nowNanos - int64(time.Minute)
+
+	for st.rateCount > 0 {
+		oldest := st.rateTimestamps[st.rateHead]
+		if oldest > cutoff {
+			break
+		}
+		st.rateHead = (st.rateHead + 1) % ringSize
+		st.rateCount--
+	}
+
+	if int(st.rateCount) >= g.cfg.maxIPRequestsPerMinute {
+		st.lastSeen = now
+		return false
+	}
+
+	index := (int(st.rateHead) + int(st.rateCount)) % ringSize
+	st.rateTimestamps[index] = nowNanos
+	st.rateCount++
 	return true
 }
 

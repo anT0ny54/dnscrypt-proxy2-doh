@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -98,11 +99,11 @@ func TestTunedDefaults(t *testing.T) {
 	if cfg.maxClientStates != defaultDoHClientStates {
 		t.Fatalf("default client states = %d, want %d", cfg.maxClientStates, defaultDoHClientStates)
 	}
-	if defaultIPConnLimit != 64 || defaultDoHIPRequests != 16 {
-		t.Fatalf("public per-client defaults = %d connections / %d requests, want 64 / 16", defaultIPConnLimit, defaultDoHIPRequests)
+	if defaultIPConnLimit != 64 || defaultDoHIPRequests != 16 || defaultDoHRequestsPerMinute != 100 {
+		t.Fatalf("public per-client defaults = %d connections / %d concurrent requests / %d requests per minute, want 64 / 16 / 100", defaultIPConnLimit, defaultDoHIPRequests, defaultDoHRequestsPerMinute)
 	}
-	if defaultMaxInflight != 64 || defaultMaxConns != 128 {
-		t.Fatalf("public concurrency defaults = %d in-flight / %d connections, want 64 / 128", defaultMaxInflight, defaultMaxConns)
+	if defaultMaxInflight != 64 || defaultMaxConns != 512 {
+		t.Fatalf("public concurrency defaults = %d in-flight / %d connections, want 64 / 512", defaultMaxInflight, defaultMaxConns)
 	}
 	if defaultMaxConns > maxMaxConns {
 		t.Fatalf("default connections = %d exceeds hard maximum %d", defaultMaxConns, maxMaxConns)
@@ -138,27 +139,34 @@ func TestServerTimeoutDefaultsAndEnv(t *testing.T) {
 }
 
 func TestGuardEnvVars(t *testing.T) {
-	for _, key := range []string{"IP_CONN_LIMIT", "DOH_MAX_IP_REQUESTS", "DOH_MAX_CLIENT_STATES"} {
+	for _, key := range []string{"IP_CONN_LIMIT", "DOH_MAX_IP_REQUESTS", "DOH_MAX_IP_REQUESTS_PER_MINUTE", "DOH_MAX_CLIENT_STATES"} {
 		t.Setenv(key, "")
 	}
 	t.Setenv("IP_CONN_LIMIT", "8")
 	t.Setenv("DOH_MAX_IP_REQUESTS", "12")
+	t.Setenv("DOH_MAX_IP_REQUESTS_PER_MINUTE", "80")
 	t.Setenv("DOH_MAX_CLIENT_STATES", "34")
 	cfg, err := clientGuardConfigFromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.maxIPConns != 8 || cfg.maxIPRequests != 12 || cfg.maxClientStates != 32 {
-		t.Fatalf("guard env values not applied: conns=%d requests=%d states=%d, want 8/12/32", cfg.maxIPConns, cfg.maxIPRequests, cfg.maxClientStates)
+	if cfg.maxIPConns != 8 || cfg.maxIPRequests != 12 || cfg.maxIPRequestsPerMinute != 80 || cfg.maxClientStates != 32 {
+		t.Fatalf("guard env values not applied: conns=%d requests=%d rpm=%d states=%d, want 8/12/80/32", cfg.maxIPConns, cfg.maxIPRequests, cfg.maxIPRequestsPerMinute, cfg.maxClientStates)
+	}
+	t.Setenv("DOH_MAX_IP_REQUESTS_PER_MINUTE", "999")
+	cfg, err = clientGuardConfigFromEnv()
+	if err != nil || cfg.maxIPRequestsPerMinute != 100 {
+		t.Fatalf("per-IP RPM over hard cap = %d, err=%v, want 100", cfg.maxIPRequestsPerMinute, err)
 	}
 }
 
 func TestClientGuardConcurrencyAndConnections(t *testing.T) {
 	g := newClientGuard(clientGuardConfig{
-		maxIPConns:      1,
-		maxIPRequests:   1,
-		maxClientStates: 16,
-		stateTTL:        5 * time.Minute,
+		maxIPConns:             1,
+		maxIPRequests:          1,
+		maxIPRequestsPerMinute: 100,
+		maxClientStates:        16,
+		stateTTL:               5 * time.Minute,
 	})
 	ip := netip.MustParseAddr("198.51.100.10")
 	t0 := time.Unix(0, 0)
@@ -190,10 +198,11 @@ func TestClientGuardConcurrencyAndConnections(t *testing.T) {
 
 func TestClientGuardAllowsBurstUpToConcurrencyCap(t *testing.T) {
 	g := newClientGuard(clientGuardConfig{
-		maxIPConns:      8,
-		maxIPRequests:   8,
-		maxClientStates: 16,
-		stateTTL:        5 * time.Minute,
+		maxIPConns:             8,
+		maxIPRequests:          8,
+		maxIPRequestsPerMinute: 100,
+		maxClientStates:        16,
+		stateTTL:               5 * time.Minute,
 	})
 	ip := netip.MustParseAddr("198.51.100.30")
 	now := time.Unix(0, 0)
@@ -210,12 +219,217 @@ func TestClientGuardAllowsBurstUpToConcurrencyCap(t *testing.T) {
 	}
 }
 
+func TestClientGuardRateLimitIsPerIPAndRollingWindow(t *testing.T) {
+	g := newClientGuard(clientGuardConfig{
+		maxIPConns:             8,
+		maxIPRequests:          8,
+		maxIPRequestsPerMinute: 100,
+		maxClientStates:        16,
+		stateTTL:               5 * time.Minute,
+	})
+	ipA := netip.MustParseAddr("198.51.100.40")
+	ipB := netip.MustParseAddr("198.51.100.41")
+	now := time.Unix(0, 0)
+
+	for i := 0; i < 100; i++ {
+		if !g.beginRequest(ipA, now) {
+			t.Fatalf("request %d from ipA was rejected before the 100 requests/minute quota", i+1)
+		}
+		g.endRequest(ipA, now)
+	}
+	if g.beginRequest(ipA, now) {
+		t.Fatal("101st request from the same IP was accepted within the rolling 60-second window")
+	}
+	if g.beginRequest(ipB, now) {
+		g.endRequest(ipB, now)
+	} else {
+		t.Fatal("independent source IP was blocked by another IP's rate limit")
+	}
+
+	stillLimited := now.Add(time.Minute - time.Nanosecond)
+	if g.beginRequest(ipA, stillLimited) {
+		t.Fatal("source IP quota expired before the full 60-second window elapsed")
+	}
+
+	windowExpired := now.Add(time.Minute)
+	if !g.beginRequest(ipA, windowExpired) {
+		t.Fatal("source IP quota did not expire after the full 60-second window")
+	}
+	g.endRequest(ipA, windowExpired)
+}
+
+func TestClientGuardStateEvictionDoesNotResetActiveRateLimit(t *testing.T) {
+	g := newClientGuard(clientGuardConfig{
+		maxIPConns:             1,
+		maxIPRequests:          1,
+		maxIPRequestsPerMinute: 100,
+		maxClientStates:        16,
+		stateTTL:               5 * time.Minute,
+	})
+	now := time.Unix(0, 0)
+	target := netip.MustParseAddr("198.51.100.60")
+	targetShard := clientShardIndex(clientIPKey(target))
+
+	for i := 0; i < 100; i++ {
+		if !g.beginRequest(target, now) {
+			t.Fatalf("target request %d was rejected", i+1)
+		}
+		g.endRequest(target, now)
+	}
+
+	findIP := func(shard int, skip netip.Addr) netip.Addr {
+		for i := 1; i < 65536; i++ {
+			ip := netip.AddrFrom4([4]byte{203, 0, byte(i >> 8), byte(i)})
+			if ip != skip && clientShardIndex(clientIPKey(ip)) == shard {
+				return ip
+			}
+		}
+		return netip.Addr{}
+	}
+
+	// Fill every other shard. The target shard remains occupied by the target
+	// state, which still has active rolling-window rate tokens despite being
+	// idle from a concurrent-work perspective.
+	for shard := 0; shard < clientGuardShardCount; shard++ {
+		if shard == targetShard {
+			continue
+		}
+		ip := findIP(shard, target)
+		if !ip.IsValid() {
+			t.Fatalf("could not find a source IP for shard %d", shard)
+		}
+		if !g.beginRequest(ip, now) {
+			t.Fatalf("failed to populate shard %d", shard)
+		}
+		g.endRequest(ip, now)
+	}
+
+	// A new source IP in the full target shard must not evict the target while
+	// its rolling-window quota is still active; otherwise source-IP churn could
+	// reset that quota and bypass the 100/minute limit.
+	churnIP := findIP(targetShard, target)
+	if !churnIP.IsValid() {
+		t.Fatal("could not find a churn IP in the target shard")
+	}
+	if g.beginRequest(churnIP, now) {
+		g.endRequest(churnIP, now)
+	}
+	if g.beginRequest(target, now) {
+		g.endRequest(target, now)
+		t.Fatal("target rate-limit state was evicted and reset under source-IP churn")
+	}
+}
+
+func TestClientGuardConcurrencyRejectionDoesNotConsumeRateLimit(t *testing.T) {
+	g := newClientGuard(clientGuardConfig{
+		maxIPConns:             1,
+		maxIPRequests:          1,
+		maxIPRequestsPerMinute: 2,
+		maxClientStates:        16,
+		stateTTL:               5 * time.Minute,
+	})
+	ip := netip.MustParseAddr("198.51.100.61")
+	now := time.Unix(0, 0)
+
+	if got := g.admitRequest(ip, now); got != requestAdmissionAllowed {
+		t.Fatalf("first admission = %v, want allowed", got)
+	}
+	if got := g.admitRequest(ip, now); got != requestAdmissionConcurrencyLimited {
+		t.Fatalf("second admission while full = %v, want concurrency-limited", got)
+	}
+	g.endRequest(ip, now)
+
+	// The rejected concurrent request must not have spent the second rate token.
+	if got := g.admitRequest(ip, now); got != requestAdmissionAllowed {
+		t.Fatalf("admission after releasing concurrency slot = %v, want allowed", got)
+	}
+	g.endRequest(ip, now)
+
+	if got := g.admitRequest(ip, now); got != requestAdmissionRateLimited {
+		t.Fatalf("third admitted request = %v, want rate-limited", got)
+	}
+}
+
+func TestClientGuardSharedIPConcurrencyStress(t *testing.T) {
+	const workers = 64
+	g := newClientGuard(clientGuardConfig{
+		maxIPConns:             64,
+		maxIPRequests:          16,
+		maxIPRequestsPerMinute: 100,
+		maxClientStates:        16,
+		stateTTL:               5 * time.Minute,
+	})
+	ip := netip.MustParseAddr("198.51.100.62")
+	now := time.Unix(0, 0)
+	start := make(chan struct{})
+	var allowed atomic.Int32
+	var rejected atomic.Int32
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			if g.admitRequest(ip, now) == requestAdmissionAllowed {
+				allowed.Add(1)
+				return
+			}
+			rejected.Add(1)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := allowed.Load(); got != 16 {
+		t.Fatalf("shared-IP concurrent admissions = %d, want 16", got)
+	}
+	if got := rejected.Load(); got != workers-16 {
+		t.Fatalf("shared-IP concurrent rejections = %d, want %d", got, workers-16)
+	}
+	for i := int32(0); i < allowed.Load(); i++ {
+		g.endRequest(ip, now)
+	}
+}
+
+func TestClientGuardManySourceIPsAtRateCeiling(t *testing.T) {
+	const sourceIPs = 128
+	g := newClientGuard(clientGuardConfig{
+		maxIPConns:             64,
+		maxIPRequests:          16,
+		maxIPRequestsPerMinute: 100,
+		maxClientStates:        8192,
+		stateTTL:               5 * time.Minute,
+	})
+	now := time.Unix(0, 0)
+	var failures atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(sourceIPs)
+	for i := 0; i < sourceIPs; i++ {
+		go func(i int) {
+			defer wg.Done()
+			ip := netip.AddrFrom4([4]byte{203, 0, byte(i >> 8), byte(i)})
+			for n := 0; n < 100; n++ {
+				if !g.beginRequest(ip, now) {
+					failures.Add(1)
+					continue
+				}
+				g.endRequest(ip, now)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if got := failures.Load(); got != 0 {
+		t.Fatalf("many-source-IP rate test rejected %d requests unexpectedly", got)
+	}
+}
+
 func TestClientGuardStateIsBounded(t *testing.T) {
 	cfg := clientGuardConfig{
-		maxIPConns:      1,
-		maxIPRequests:   1,
-		maxClientStates: 16,
-		stateTTL:        5 * time.Minute,
+		maxIPConns:             1,
+		maxIPRequests:          1,
+		maxIPRequestsPerMinute: 100,
+		maxClientStates:        16,
+		stateTTL:               5 * time.Minute,
 	}
 	g := newClientGuard(cfg)
 	now := time.Unix(0, 0)
@@ -260,10 +474,11 @@ func TestGuardListenerImmediateCloseWhenGlobalFull(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := clientGuardConfig{
-		maxIPConns:      4,
-		maxIPRequests:   4,
-		maxClientStates: 16,
-		stateTTL:        5 * time.Minute,
+		maxIPConns:             4,
+		maxIPRequests:          4,
+		maxIPRequestsPerMinute: 100,
+		maxClientStates:        16,
+		stateTTL:               5 * time.Minute,
 	}
 	guard := newClientGuard(cfg)
 	ln := newGuardListener(base, guard, 1)
@@ -344,8 +559,8 @@ func TestRequestClientIPTrustsOnlyConfiguredProxy(t *testing.T) {
 func TestGlobalConnLimitUsesCanonicalEnvAndLegacyAlias(t *testing.T) {
 	t.Setenv("GLOBAL_CONN_LIMIT", "")
 	t.Setenv("DOH_MAX_CONNS", "")
-	if got := globalConnLimitFromEnv(); got != 128 {
-		t.Fatalf("default global connection limit = %d, want 128", got)
+	if got := globalConnLimitFromEnv(); got != 512 {
+		t.Fatalf("default global connection limit = %d, want 512", got)
 	}
 
 	t.Setenv("DOH_MAX_CONNS", "64")
@@ -359,8 +574,8 @@ func TestGlobalConnLimitUsesCanonicalEnvAndLegacyAlias(t *testing.T) {
 	}
 
 	t.Setenv("GLOBAL_CONN_LIMIT", "999")
-	if got := globalConnLimitFromEnv(); got != 128 {
-		t.Fatalf("GLOBAL_CONN_LIMIT over hard cap = %d, want 128", got)
+	if got := globalConnLimitFromEnv(); got != 512 {
+		t.Fatalf("GLOBAL_CONN_LIMIT over hard cap = %d, want 512", got)
 	}
 }
 
@@ -865,10 +1080,11 @@ func TestDoHHandlerAppliesPerIPConcurrencyCap(t *testing.T) {
 	}()
 
 	guard := newClientGuard(clientGuardConfig{
-		maxIPConns:      8,
-		maxIPRequests:   1,
-		maxClientStates: 16,
-		stateTTL:        5 * time.Minute,
+		maxIPConns:             8,
+		maxIPRequests:          1,
+		maxIPRequestsPerMinute: 100,
+		maxClientStates:        16,
+		stateTTL:               5 * time.Minute,
 	})
 	h := dohHandlerWithGuardTimeout(addr, "/dns-query", maxDNSPacket, 2, defaultDNSTransportLimits(), guard, nil, 5*time.Second)
 
@@ -903,6 +1119,157 @@ func TestDoHHandlerAppliesPerIPConcurrencyCap(t *testing.T) {
 	case <-firstDone:
 	case <-time.After(time.Second):
 		t.Fatal("first request did not stop after cancellation")
+	}
+}
+
+func TestDoHHandlerAppliesPerIPRateLimit(t *testing.T) {
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+
+	query := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	go func() {
+		buf := make([]byte, maxDNSPacket)
+		n, client, err := udp.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		buf[2] |= 0x80
+		_, _ = udp.WriteToUDP(buf[:n], client)
+	}()
+
+	guard := newClientGuard(clientGuardConfig{
+		maxIPConns:             8,
+		maxIPRequests:          8,
+		maxIPRequestsPerMinute: 1,
+		maxClientStates:        16,
+		stateTTL:               5 * time.Minute,
+	})
+	h := dohHandlerWithGuardTimeout(udp.LocalAddr().String(), "/dns-query", maxDNSPacket, 8, defaultDNSTransportLimits(), guard, nil, time.Second)
+
+	first := httptest.NewRequest(http.MethodPost, "/dns-query", bytes.NewReader(query))
+	first.RemoteAddr = "198.51.100.50:1000"
+	first.Header.Set("Content-Type", "application/dns-message")
+	firstRec := httptest.NewRecorder()
+	h(firstRec, first)
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("first request status = %d, want %d", firstRec.Code, http.StatusOK)
+	}
+
+	second := httptest.NewRequest(http.MethodPost, "/dns-query", bytes.NewReader(query))
+	second.RemoteAddr = "198.51.100.50:2000"
+	second.Header.Set("Content-Type", "application/dns-message")
+	secondRec := httptest.NewRecorder()
+	h(secondRec, second)
+	if secondRec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request status = %d, want %d", secondRec.Code, http.StatusTooManyRequests)
+	}
+	if got := secondRec.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("rate-limited Retry-After = %q, want 1", got)
+	}
+}
+
+func TestDoHServerPersistentKeepAliveRateLimit(t *testing.T) {
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+
+	query := []byte{0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	go func() {
+		buf := make([]byte, maxDNSPacket)
+		for {
+			n, client, err := udp.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			buf[2] |= 0x80
+			_, _ = udp.WriteToUDP(buf[:n], client)
+		}
+	}()
+
+	guard := newClientGuard(clientGuardConfig{
+		maxIPConns:             64,
+		maxIPRequests:          16,
+		maxIPRequestsPerMinute: 100,
+		maxClientStates:        16,
+		stateTTL:               5 * time.Minute,
+	})
+	base, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln := newGuardListener(base, guard, 512)
+	server := &http.Server{
+		Handler:           dohHandlerWithGuardTimeout(udp.LocalAddr().String(), "/dns-query", maxDNSPacket, 16, defaultDNSTransportLimits(), guard, nil, time.Second),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      8 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(ln) }()
+	defer func() {
+		_ = server.Close()
+		select {
+		case <-serveDone:
+		case <-time.After(time.Second):
+			t.Fatal("HTTP server did not stop")
+		}
+	}()
+
+	var dials atomic.Int32
+	transport := &http.Transport{
+		MaxIdleConns:        1,
+		MaxIdleConnsPerHost: 1,
+		DisableKeepAlives:   false,
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			dials.Add(1)
+			return (&net.Dialer{}).DialContext(ctx, network, address)
+		},
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+
+	encodedBody := query
+	for i := 0; i < 100; i++ {
+		req, err := http.NewRequest(http.MethodPost, "http://"+base.Addr().String()+"/dns-query", bytes.NewReader(encodedBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/dns-message")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request %d: %v", i+1, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d status = %d, want %d", i+1, resp.StatusCode, http.StatusOK)
+		}
+	}
+
+	req, err := http.NewRequest(http.MethodPost, "http://"+base.Addr().String()+"/dns-query", bytes.NewReader(encodedBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/dns-message")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("101st keep-alive request status = %d, want %d", resp.StatusCode, http.StatusTooManyRequests)
+	}
+	if got := resp.Header.Get("Retry-After"); got != "1" {
+		t.Fatalf("101st keep-alive Retry-After = %q, want 1", got)
+	}
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("keep-alive TCP dials = %d, want 1", got)
 	}
 }
 
@@ -985,10 +1352,11 @@ func TestGuardListenerEnforcesPerIPConnectionCapForUntrustedPeers(t *testing.T) 
 		t.Fatal(err)
 	}
 	guard := newClientGuard(clientGuardConfig{
-		maxIPConns:      1,
-		maxIPRequests:   4,
-		maxClientStates: 16,
-		stateTTL:        5 * time.Minute,
+		maxIPConns:             1,
+		maxIPRequests:          4,
+		maxIPRequestsPerMinute: 100,
+		maxClientStates:        16,
+		stateTTL:               5 * time.Minute,
 	})
 	ln := newGuardListener(base, guard, 8)
 	defer ln.Close()
@@ -1038,10 +1406,11 @@ func TestGuardListenerEnforcesPerIPConnectionCapForUntrustedPeers(t *testing.T) 
 
 func TestGuardConnRebindsPerClientIdentity(t *testing.T) {
 	g := newClientGuard(clientGuardConfig{
-		maxIPConns:      1,
-		maxIPRequests:   4,
-		maxClientStates: 16,
-		stateTTL:        5 * time.Minute,
+		maxIPConns:             1,
+		maxIPRequests:          4,
+		maxIPRequestsPerMinute: 100,
+		maxClientStates:        16,
+		stateTTL:               5 * time.Minute,
 	})
 
 	client, server := net.Pipe()

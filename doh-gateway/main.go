@@ -36,9 +36,9 @@ const (
 
 	defaultMaxBody        = 4 << 10 // 4 KiB request query limit
 	defaultMaxInflight    = 64
-	defaultMaxConns       = 128
+	defaultMaxConns       = 512
 	maxMaxInflight        = 64
-	maxMaxConns           = 128
+	maxMaxConns           = 512
 	defaultDoHIdleTimeout = 120 * time.Second
 
 	// headerOverhead budgets for the request line/method/host and the fixed
@@ -511,12 +511,18 @@ func dohHandlerWithGuardTimeout(upstream, path string, maxBody, maxInflight int,
 				writeText(w, http.StatusBadRequest, "invalid or missing client identity\n")
 				return
 			}
-			if conn := guardConnFromContext(r.Context()); conn != nil && !conn.rebindClient(clientIP, time.Now()) {
+			now := time.Now()
+			if conn := guardConnFromContext(r.Context()); conn != nil && !conn.rebindClient(clientIP, now) {
 				w.Header().Set("Retry-After", "1")
 				writeText(w, http.StatusServiceUnavailable, "client connection limit exceeded\n")
 				return
 			}
-			if !guard.beginRequest(clientIP, time.Now()) {
+			switch guard.admitRequest(clientIP, now) {
+			case requestAdmissionRateLimited:
+				w.Header().Set("Retry-After", "1")
+				writeText(w, http.StatusTooManyRequests, "source IP request rate limit exceeded\n")
+				return
+			case requestAdmissionConcurrencyLimited:
 				w.Header().Set("Retry-After", "1")
 				writeText(w, http.StatusServiceUnavailable, "client concurrency limit exceeded\n")
 				return
