@@ -43,32 +43,33 @@ The gateway's DNS backend is intentionally fixed at `127.0.0.1:5300`; there is n
 
 ## Resource tuning
 
-The defaults target a small 512 MiB / 0.25 vCPU instance without allocating per-request token-bucket state:
+The defaults target a small 512 MiB / 0.25 vCPU instance without allocating unbounded per-request state; rate-limit state is kept per source IP and bounded:
 
 | Setting | Default | Reason |
 |---|---:|---|
 | `max_clients` | `64` | Resolver-side concurrency ceiling; aligned with the gateway's hard `DOH_MAX_INFLIGHT` cap. |
 | `DOH_MAX_INFLIGHT` | `64` | Global concurrent DNS-exchange ceiling. Requests over the ceiling fail fast with HTTP 503. |
-| `GLOBAL_CONN_LIMIT` | `128` | Canonical global active TCP-connection ceiling enforced at `Accept` time; when unset, the legacy `DOH_MAX_CONNS` value is used before falling back to `128`. |
+| `GLOBAL_CONN_LIMIT` | `512` | Canonical global active TCP-connection ceiling enforced at `Accept` time; when unset, the legacy `DOH_MAX_CONNS` value is used before falling back to `512`. Idle keep-alive connections are bounded here; actual DNS work remains capped at 64. |
 | `IP_CONN_LIMIT` | `64` | Per-client active TCP connection ceiling. With a trusted reverse proxy, the slot follows the forwarded client identity rather than the proxy socket. |
-| `DOH_MAX_IP_REQUESTS` | `16` | Per-client concurrent DoH exchange ceiling. This is concurrency protection, not a request-rate bucket. |
+| `DOH_MAX_IP_REQUESTS` | `16` | Per-client concurrent DoH exchange ceiling. This remains separate from the source-IP rate limit. |
+| `DOH_MAX_IP_REQUESTS_PER_MINUTE` | `100` | Per-source-IP request-rate ceiling using a bounded rolling 60-second window; hard-capped at 100 requests/minute. Excess requests receive HTTP 429. |
 | `DOH_MAX_CLIENT_STATES` | `8192` | Hard-bounded source-IP state across 16 shards; only idle states are evicted. |
 | `DOH_MAX_UDP_PACKET` | `8192` | Resolver-leg UDP packet limit; oversized datagrams are discarded before DNS parsing. |
 | `DOH_MAX_TCP_FRAME` | `8192` | Resolver-leg DNS-over-TCP frame limit, checked before body allocation. |
 | `DOH_MAX_BODY` | `4096` | Public DoH request DNS-message limit; effective value cannot exceed the TCP frame limit. |
 | `DNSCRYPT_GOMEMLIMIT` | `288MiB` | Main resolver Go heap target; paired with `64MiB` gateway heap target, leaving non-heap/runtime headroom inside a 512 MiB instance. |
-| `DOH_GOMEMLIMIT` | `64MiB` | Gateway Go heap target; the gateway has no rate-state/token storage. |
+| `DOH_GOMEMLIMIT` | `64MiB` | Gateway Go heap target; per-source-IP rate state is stored in the existing bounded client-state map. |
 | `GOMAXPROCS` | `1` | Appropriate for a 0.25 vCPU service. |
 | DNS cache (`cache_size`) | `8192` entries | Keeps cache memory bounded for a 512 MiB instance while retaining useful hit rate across clients. |
 | upstream `timeout` | `5000` ms | Below the gateway's default 6 s local exchange deadline. |
 | upstream `keepalive` | `120` s | Avoids repeated TLS setup for the three fixed upstream DoH resolvers. |
 | `cert_refresh_concurrency` / `cert_refresh_delay` | `2` / `240` min | Bounds background certificate-refresh concurrency and probing frequency. |
 
-For the requested profile, the effective public limits are **`GLOBAL_CONN_LIMIT=128`**, **`IP_CONN_LIMIT=64`**, **`DOH_MAX_BODY=4096`**, **`SERVER_TIMEOUT=6s`**, **`DOH_MAX_INFLIGHT=64`**, and **`DOH_MAX_IP_REQUESTS=16`**. There is no request-rate token bucket. In this dnscrypt-proxy adaptation, `UPSTREAM_MAX_CONNS=4` is not exposed as a separate setting because dnscrypt-proxy owns the encrypted upstream HTTPS connection management internally; the gateway talks only to `127.0.0.1:5300`, while `max_clients=64` bounds resolver-side concurrency. There is likewise no separate `CACHE_MAX_ENTRY_BYTES` knob in dnscrypt-proxy; the public DNS-message limit is `4096` bytes and the resolver-leg transport frame ceiling is `8192` bytes.
+For the requested profile, the effective public limits are **`GLOBAL_CONN_LIMIT=512`**, **`IP_CONN_LIMIT=64`**, **`DOH_MAX_BODY=4096`**, **`SERVER_TIMEOUT=6s`**, **`DOH_MAX_INFLIGHT=64`**, **`DOH_MAX_IP_REQUESTS=16`**, and **`DOH_MAX_IP_REQUESTS_PER_MINUTE=100`**. The 100 requests/minute source-IP limit is enforced independently from the concurrency limits. In this dnscrypt-proxy adaptation, `UPSTREAM_MAX_CONNS=4` is not exposed as a separate setting because dnscrypt-proxy owns the encrypted upstream HTTPS connection management internally; the gateway talks only to `127.0.0.1:5300`, while `max_clients=64` bounds resolver-side concurrency. There is likewise no separate `CACHE_MAX_ENTRY_BYTES` knob in dnscrypt-proxy; the public DNS-message limit is `4096` bytes and the resolver-leg transport frame ceiling is `8192` bytes.
 
 The gateway uses a **5-second** HTTP read deadline, an **8-second** write deadline, and a **120-second** idle timeout. Each DNS exchange has one combined **6-second** local deadline, including a possible UDP-to-TCP retry.
 
-There is **no token-bucket or request-rate limiter**. Resource protection is provided by bounded global in-flight work, bounded active connections, bounded per-source-IP connections/requests, and bounded client-state memory. This avoids delaying legitimate bursts while still preventing a single source from taking all request slots.
+The gateway uses a bounded **per-source-IP rolling 60-second window at 100 requests/minute**. Each source-IP state keeps at most 100 request timestamps in a fixed ring, so rate-limit memory is bounded and independent of total traffic. The 101st request inside the active 60-second window fails fast with HTTP 429; the global 64-exchange ceiling continues to protect the 0.25-vCPU instance.
 
 The gateway rejects malformed/oversized input before DNS exchange, buffers and bounds backend responses before returning them, validates DNS response headers against the original query, and never writes a partial backend response as a successful `200 OK`.
 
@@ -124,6 +125,7 @@ Security/resource controls include:
 - unprivileged runtime user;
 - bounded request/body/header sizes, in-flight exchanges, and connections;
 - per-source-IP concurrent request and connection caps;
+- per-source-IP rate limit of 100 requests/minute with a bounded rolling-window ring;
 - bounded source-IP state with idle-only eviction;
 - immediate TCP closes for global/per-source connection overflow;
 - oversized UDP datagram rejection before DNS parsing;
@@ -145,9 +147,10 @@ Safe defaults are built into the image. Normally only `PORT` needs to match the 
 | `DOH_PATH` | `/dns-query` | Public DoH path; `/`, `/healthz`, and `/readyz` are reserved. |
 | `DOH_MAX_BODY` | `4096` | Public DNS-message limit; effective cap is the lower of this value and `DOH_MAX_TCP_FRAME`. |
 | `DOH_MAX_INFLIGHT` | `64` | Global concurrent DNS-exchange cap; hard-capped at `64`. |
-| `DOH_MAX_CONNS` | `128` | Legacy compatibility alias used only when `GLOBAL_CONN_LIMIT` is unset/empty; hard-capped at `128`. |
+| `DOH_MAX_CONNS` | `512` | Legacy compatibility alias used only when `GLOBAL_CONN_LIMIT` is unset/empty; hard-capped at `512`. |
 | `IP_CONN_LIMIT` | `64` | Per-client active connection cap; hard-capped at `64`. With a trusted proxy, identity comes from final `X-Forwarded-For` and the connection slot can rebind on keep-alive requests. |
-| `DOH_MAX_IP_REQUESTS` | `16` | Per-source-IP concurrent DoH request cap; hard-capped at `64`. |
+| `DOH_MAX_IP_REQUESTS` | `16` | Per-source-IP concurrent DoH request cap; hard-capped at `64`. This is separate from the per-minute rate limit. |
+| `DOH_MAX_IP_REQUESTS_PER_MINUTE` | `100` | Per-source-IP rate cap; hard-capped at `100` requests/minute. Excess requests receive `429 Too Many Requests`. |
 | `DOH_MAX_CLIENT_STATES` | `8192` | Bounded to `16`-`32768`, rounded down to a multiple of the 16 guard shards. |
 | `SERVER_TIMEOUT` | `6` seconds | Shared local DNS exchange deadline, including UDP-to-TCP fallback. |
 | `DOH_IDLE_TIMEOUT` | `120` seconds | HTTP keep-alive idle timeout; active DNS exchanges are bounded separately. |
